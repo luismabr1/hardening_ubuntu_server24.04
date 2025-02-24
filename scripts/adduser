@@ -1,17 +1,100 @@
-function f_adduser {
-  echo "[$SCRIPT_COUNT] $ADDUSER and $USERADD"
+#!/bin/bash
 
+# Additional configuration for this script
+LOG_FILE="/var/log/user_hardening.log"
+BACKUP_DIR="/root/backups"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+SCRIPT_COUNT=0
 
-  sed -i -e 's/^DIR_MODE=.*/DIR_MODE=0750/' -e 's/^#DIR_MODE=.*/DIR_MODE=0750/' "$ADDUSER"
-  sed -i -e 's/^DSHELL=.*/DSHELL=\/bin\/false/' -e 's/^#DSHELL=.*/DSHELL=\/bin\/false/' "$ADDUSER"
-  sed -i -e 's/^USERGROUPS=.*/USERGROUPS=yes/' -e 's/^#USERGROUPS=.*/USERGROUPS=yes/' "$ADDUSER"
-
-  sed -i 's/^SHELL=.*/SHELL=\/bin\/false/' "$USERADD"
-  sed -i 's/^# INACTIVE=.*/INACTIVE=30/' "$USERADD"
-
-  awk -F ':' '{if($3 >= 1000 && $3 <= 65000) print $6}' /etc/passwd | while read -r userhome; do
-    chmod 0750 "$userhome"
-  done
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_adduser {
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        return 1
+    fi
+    # Create backup directory if it doesn't exist
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory"
+        return 1
+    }
+
+    # Backup original config files
+    cp "$ADDUSER" "$BACKUP_DIR/adduser.conf.$TIMESTAMP" && \
+    cp "$USERADD" "$BACKUP_DIR/useradd.$TIMESTAMP" || {
+        log_message "ERROR: Failed to create backups"
+        return 1
+    }
+    
+    log_message "INFO: Created backups in $BACKUP_DIR"
+
+    # Check if config files exist and are writable
+    for file in "$ADDUSER" "$USERADD"; do
+        if [[ ! -f "$file" ]]; then
+            log_message "ERROR: $file not found"
+            return 1
+        fi
+        if [[ ! -w "$file" ]]; then
+            log_message "ERROR: $file is not writable"
+            return 1
+        fi
+    done
+
+    # Modify adduser.conf
+    local settings=(
+        "s/^DIR_MODE=.*/DIR_MODE=0750/"
+        "s/^#DIR_MODE=.*/DIR_MODE=0750/"
+        "s/^DSHELL=.*/DSHELL=\/bin\/false/"
+        "s/^#DSHELL=.*/DSHELL=\/bin\/false/"
+        "s/^USERGROUPS=.*/USERGROUPS=yes/"
+        "s/^#USERGROUPS=.*/USERGROUPS=yes/"
+    )
+    
+    for setting in "${settings[@]}"; do
+        sed -i "$setting" "$ADDUSER" && \
+            log_message "INFO: Successfully applied $setting to $ADDUSER" || \
+            log_message "ERROR: Failed to apply $setting to $ADDUSER"
+    done
+
+    # Modify useradd defaults
+    sed -i "s/^SHELL=.*/SHELL=\/bin\/false/" "$USERADD" && \
+        log_message "INFO: Set default shell to /bin/false" || \
+        log_message "ERROR: Failed to set default shell"
+    
+    sed -i "s/^# INACTIVE=.*/INACTIVE=30/" "$USERADD" && \
+        log_message "INFO: Set account inactivity to 30 days" || \
+        log_message "ERROR: Failed to set inactivity period"
+
+    # Harden existing user home directories
+    local changed=0
+    while IFS=':' read -r username _ _ uid _ home _; do
+        # Skip system accounts and invalid entries
+        [[ "$uid" -lt 1000 || "$uid" -gt 65000 || -z "$home" ]] && continue
+        
+        if [[ -d "$home" ]]; then
+            chmod 0750 "$home" 2>/dev/null && {
+                log_message "INFO: Hardened permissions on $home"
+                ((changed++))
+            } || log_message "WARNING: Failed to harden $home"
+        fi
+    done < /etc/passwd
+
+    log_message "INFO: Modified permissions for $changed user directories"
+    echo "Hardening complete. Check $LOG_FILE for details"
+    ((SCRIPT_COUNT++))
+}
+
+# Main execution
+if [[ "$VERBOSE" == "Y" ]]; then
+    echo "Starting user hardening process..."
+fi
+
+f_adduser
+
+if [[ "$VERBOSE" == "Y" ]]; then
+    echo "Completed. Steps executed: $SCRIPT_COUNT"
+fi
