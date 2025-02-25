@@ -1,10 +1,92 @@
-function f_prelink {
-  echo "[$SCRIPT_COUNT] Prelink"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
 
-  if dpkg -l | grep prelink 1> /dev/null; then
-    "$(command -v prelink)" -ua 2> /dev/null
-    "$APT" purge prelink
-  fi
+# No new variables needed for this script; existing ones suffice
 
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_prelink {
+    echo "[$SCRIPT_COUNT] Removing prelink to eliminate binary prelinking risks"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure apt is installed (for package management)
+    if ! dpkg -l | grep -q "^ii.*apt"; then
+        log_message "WARNING: apt package not found, required for package management"
+        log_message "INFO: Attempting to install apt"
+        if $APT install -y apt 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed apt"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install apt - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: apt package is already installed"
+    fi
+
+    # Check if prelink is installed and proceed with removal
+    if dpkg -l | grep -q "^ii.*prelink" 2>/tmp/dpkg_error; then
+        log_message "INFO: prelink package detected, proceeding with removal"
+
+        # Undo prelinking
+        local prelink_cmd
+        prelink_cmd=$(command -v prelink)
+        if [[ -n "$prelink_cmd" ]]; then
+            if "$prelink_cmd" -ua 2>/tmp/prelink_error; then
+                log_message "INFO: Successfully undid prelinking with '$prelink_cmd -ua'"
+            else
+                local error_msg=$(cat /tmp/prelink_error)
+                log_message "WARNING: Failed to undo prelinking - Error: $error_msg"
+                # Continue despite warning, as purging is the main goal
+            fi
+        else
+            log_message "WARNING: prelink command not found, skipping prelink undo step"
+        fi
+
+        # Purge prelink package (CIS 2.2.1)
+        if $APT purge -y prelink 2>/tmp/purge_error; then
+            log_message "INFO: Successfully purged prelink package"
+        else
+            local error_msg=$(cat /tmp/purge_error)
+            log_message "ERROR: Failed to purge prelink package - Error: $error_msg"
+            rm -f /tmp/purge_error
+            return 1
+        fi
+
+        # Verify prelink removal
+        if ! dpkg -l | grep -q "^ii.*prelink" 2>/dev/null; then
+            log_message "INFO: Verified prelink package is no longer installed"
+        else
+            log_message "WARNING: prelink package still detected after attempted purge"
+        fi
+    else
+        log_message "INFO: prelink package not installed, no action needed"
+        local dpkg_error=$(cat /tmp/dpkg_error 2>/dev/null)
+        [[ -n "$dpkg_error" ]] && log_message "WARNING: dpkg check failed - Error: $dpkg_error"
+    fi
+    rm -f /tmp/dpkg_error /tmp/prelink_error /tmp/purge_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_prelink

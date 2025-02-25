@@ -1,40 +1,223 @@
-function f_sudo {
-  echo "[$SCRIPT_COUNT] sudo configuration"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+# HOSTS_EQUIV='/etc/hosts.equiv'
+# SECURETTY='/etc/securetty'
+# DEBUG_SHELL_SERVICE='debug-shell.service'
+# SSH_MODULI='/etc/ssh/moduli'
+# SSH_SERVICE='ssh.service'
 
-  if ! grep -qER '^Defaults.*use_pty$' /etc/sudo*; then
-    echo "Defaults use_pty" > /etc/sudoers.d/011_use_pty
-  fi
+# New variables to add to global variables file:
+# SUDOERS_DIR='/etc/sudoers.d'  # Directory for sudoers configuration files
+# PAM_SU='/etc/pam.d/su'        # Path to PAM configuration for su
+# SUDO_LOG='/var/log/sudo.log'  # Path to sudo log file
 
-  if ! grep -qER '^Defaults.*logfile' /etc/sudo*; then
-    echo 'Defaults logfile="/var/log/sudo.log"' > /etc/sudoers.d/012_logfile
-  fi
-
-  if ! grep -qER '^Defaults.*pwfeedback' /etc/sudo*; then
-    echo 'Defaults !pwfeedback' > /etc/sudoers.d/013_pwfeedback
-  fi
-
-  if ! grep -qER '^Defaults.*visiblepw' /etc/sudo*; then
-    echo 'Defaults !visiblepw' > /etc/sudoers.d/014_visiblepw
-  fi
-
-  if ! grep -qER '^Defaults.*passwd_timeout' /etc/sudo*; then
-    echo 'Defaults passwd_timeout=1' > /etc/sudoers.d/015_passwdtimeout
-  fi
-
-  if ! grep -qER '^Defaults.*timestamp_timeout' /etc/sudo*; then
-    echo 'Defaults timestamp_timeout=5' > /etc/sudoers.d/016_timestamptimeout
-  fi
-
-  find /etc/sudoers.d/ -type f -name '[0-9]*' -exec chmod 0440 {} \;
-
-  if ! grep -qER '^auth required pam_wheel.so' /etc/pam.d/su; then
-    echo "auth required pam_wheel.so use_uid group=sudo" >> /etc/pam.d/su
-  fi
-
-  if [[ $VERBOSE == "Y" ]]; then
-    sudo -ll
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_sudo {
+    echo "[$SCRIPT_COUNT] Configuring sudo for enhanced security and auditing"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure sudo and libpam-modules are installed
+    local required_pkgs=("sudo" "libpam-modules")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg not found, required for sudo PAM configuration"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+
+    # Backup sudoers.d and PAM files
+    local sudoers_dir="/etc/sudoers.d"  # Using SUDOERS_DIR if defined
+    local pam_su="/etc/pam.d/su"        # Using PAM_SU if defined
+    local files=("$pam_su")
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        fi
+    done
+    # Backup existing sudoers.d files
+    if [[ -d "$sudoers_dir" ]]; then
+        local sudoers_files
+        sudoers_files=$(find "$sudoers_dir" -type f -name '[0-9]*' 2>/tmp/find_error)
+        if [[ $? -eq 0 ]]; then
+            while IFS= read -r file; do
+                if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                    log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+                else
+                    local error_msg=$(cat /tmp/cp_error)
+                    log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                    rm -f /tmp/cp_error
+                    return 1
+                fi
+            done <<< "$sudoers_files"
+        else
+            local error_msg=$(cat /tmp/find_error)
+            log_message "WARNING: Failed to list files in $sudoers_dir - Error: $error_msg"
+        fi
+    fi
+
+    # Ensure sudoers.d directory exists and is writable
+    if [[ ! -d "$sudoers_dir" ]]; then
+        if mkdir -p "$sudoers_dir" 2>/tmp/mkdir_error; then
+            log_message "INFO: Created $sudoers_dir"
+        else
+            local error_msg=$(cat /tmp/mkdir_error)
+            log_message "ERROR: Failed to create $sudoers_dir - Error: $error_msg"
+            rm -f /tmp/mkdir_error
+            return 1
+        fi
+    fi
+
+    # Configure sudoers.d settings (CIS 5.3.4)
+    local sudo_settings=(
+        "use_pty:011_use_pty:Defaults use_pty"
+        "logfile:012_logfile:Defaults logfile=\"/var/log/sudo.log\""
+        "pwfeedback:013_pwfeedback:Defaults !pwfeedback"
+        "visiblepw:014_visiblepw:Defaults !visiblepw"
+        "passwd_timeout:015_passwdtimeout:Defaults passwd_timeout=1"
+        "timestamp_timeout:016_timestamptimeout:Defaults timestamp_timeout=5"
+    )
+    for setting in "${sudo_settings[@]}"; do
+        local key=$(echo "$setting" | cut -d':' -f1)
+        local filename=$(echo "$setting" | cut -d':' -f2)
+        local value=$(echo "$setting" | cut -d':' -f3-)
+        local file="$sudoers_dir/$filename"
+        if ! grep -qER "^[#]*Defaults.*$key" /etc/sudo* 2>/dev/null; then
+            if echo "$value" > "$file" 2>/tmp/echo_error; then
+                log_message "INFO: Added '$value' to $file"
+                if chmod 0440 "$file" 2>/tmp/chmod_error; then
+                    log_message "INFO: Set permissions to 0440 on $file"
+                else
+                    local error_msg=$(cat /tmp/chmod_error)
+                    log_message "ERROR: Failed to set permissions on $file - Error: $error_msg"
+                    rm -f /tmp/chmod_error
+                    return 1
+                fi
+                if chown root:root "$file" 2>/tmp/chown_error; then
+                    log_message "INFO: Set ownership to root:root on $file"
+                else
+                    local error_msg=$(cat /tmp/chown_error)
+                    log_message "ERROR: Failed to set ownership on $file - Error: $error_msg"
+                    rm -f /tmp/chown_error
+                    return 1
+                fi
+            else
+                local error_msg=$(cat /tmp/echo_error)
+                log_message "ERROR: Failed to write '$value' to $file - Error: $error_msg"
+                rm -f /tmp/echo_error
+                return 1
+            fi
+        else
+            log_message "INFO: Setting matching '$key' already exists in /etc/sudo* files"
+        fi
+    done
+
+    # Set permissions on all sudoers.d files
+    if find "$sudoers_dir" -type f -name '[0-9]*' -exec chmod 0440 {} \; 2>/tmp/find_error; then
+        log_message "INFO: Set permissions to 0440 on all numbered files in $sudoers_dir"
+    else
+        local error_msg=$(cat /tmp/find_error)
+        log_message "ERROR: Failed to set permissions on $sudoers_dir files - Error: $error_msg"
+        rm -f /tmp/find_error
+        return 1
+    fi
+
+    # Configure PAM for su (CIS 5.6)
+    if [[ -f "$pam_su" ]]; then
+        if ! grep -q "^[#]*auth required pam_wheel.so" "$pam_su" 2>/dev/null; then
+            if echo "auth required pam_wheel.so use_uid group=sudo" >> "$pam_su" 2>/tmp/echo_error; then
+                log_message "INFO: Added pam_wheel.so restriction to $pam_su"
+            else
+                local error_msg=$(cat /tmp/echo_error)
+                log_message "ERROR: Failed to add pam_wheel.so to $pam_su - Error: $error_msg"
+                rm -f /tmp/echo_error
+                return 1
+            fi
+        else
+            log_message "INFO: pam_wheel.so already configured in $pam_su"
+        fi
+    else
+        log_message "ERROR: $pam_su not found, cannot configure PAM for su"
+        return 1
+    fi
+
+    # Verify sudo configuration
+    local verified=true
+    local settings_to_check=(
+        "use_pty"
+        "logfile=\"/var/log/sudo.log\""
+        "!pwfeedback"
+        "!visiblepw"
+        "passwd_timeout=1"
+        "timestamp_timeout=5"
+    )
+    for setting in "${settings_to_check[@]}"; do
+        if ! grep -r "Defaults.*$setting" "$sudoers_dir" >/dev/null 2>&1; then
+            log_message "WARNING: Setting 'Defaults.*$setting' not found in $sudoers_dir"
+            verified=false
+        fi
+    done
+    if grep -q "^[#]*auth required pam_wheel.so.*group=sudo" "$pam_su" 2>/dev/null; then
+        log_message "INFO: Verified pam_wheel.so restriction in $pam_su"
+    else
+        log_message "WARNING: pam_wheel.so restriction not found in $pam_su"
+        verified=false
+    fi
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified all sudo configuration settings"
+    fi
+
+    # Show sudo config if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        sudo -ll
+        echo
+    fi
+    rm -f /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/find_error /tmp/cp_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_sudo

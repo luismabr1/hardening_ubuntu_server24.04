@@ -1,11 +1,120 @@
-function f_hosts {
-  echo "[$SCRIPT_COUNT] /etc/hosts.allow and /etc/hosts.deny"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
 
-  echo "sshd : ALL : ALLOW" > /etc/hosts.allow
-  echo "ALL: LOCAL, 127.0.0.1" >> /etc/hosts.allow
-  echo "ALL: ALL" > /etc/hosts.deny
-  chmod 644 /etc/hosts.allow
-  chmod 644 /etc/hosts.deny
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_hosts {
+    echo "[$SCRIPT_COUNT] Configuring /etc/hosts.allow and /etc/hosts.deny for network access control"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure TCP Wrappers package is installed (libwrap0 provides /etc/hosts.allow and deny)
+    if ! dpkg -l | grep -q "^ii.*libwrap0"; then
+        log_message "WARNING: libwrap0 package not found, required for TCP Wrappers configuration"
+        log_message "INFO: Attempting to install libwrap0"
+        if $APT install -y libwrap0 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed libwrap0"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install libwrap0 - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: libwrap0 package is already installed"
+    fi
+    rm -f /tmp/apt_install_error
+
+    # Backup existing hosts files
+    local files=("/etc/hosts.allow" "/etc/hosts.deny")
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        fi
+    done
+
+    # Configure /etc/hosts.allow (CIS 3.4.2)
+    if echo "sshd : ALL : ALLOW" > /etc/hosts.allow 2>/tmp/echo_error; then
+        log_message "INFO: Set sshd to allow all connections in /etc/hosts.allow"
+    else
+        local error_msg=$(cat /tmp/echo_error)
+        log_message "ERROR: Failed to configure sshd in /etc/hosts.allow - Error: $error_msg"
+        rm -f /tmp/echo_error
+        return 1
+    fi
+    if echo "ALL: LOCAL, 127.0.0.1" >> /etc/hosts.allow 2>/tmp/echo_error; then
+        log_message "INFO: Allowed all services from local and 127.0.0.1 in /etc/hosts.allow"
+    else
+        local error_msg=$(cat /tmp/echo_error)
+        log_message "ERROR: Failed to append local access to /etc/hosts.allow - Error: $error_msg"
+        rm -f /tmp/echo_error
+        return 1
+    fi
+
+    # Configure /etc/hosts.deny
+    if echo "ALL: ALL" > /etc/hosts.deny 2>/tmp/echo_error; then
+        log_message "INFO: Denied all other connections in /etc/hosts.deny"
+    else
+        local error_msg=$(cat /tmp/echo_error)
+        log_message "ERROR: Failed to configure /etc/hosts.deny - Error: $error_msg"
+        rm -f /tmp/echo_error
+        return 1
+    fi
+
+    # Set secure permissions (CIS 3.4.2 recommends 0644, aligning with original)
+    for file in "${files[@]}"; do
+        if chmod 0644 "$file" 2>/tmp/chmod_error; then
+            log_message "INFO: Set permissions to 0644 on $file"
+        else
+            local error_msg=$(cat /tmp/chmod_error)
+            log_message "ERROR: Failed to set permissions on $file - Error: $error_msg"
+            rm -f /tmp/chmod_error
+            return 1
+        fi
+        if chown root:root "$file" 2>/tmp/chown_error; then
+            log_message "INFO: Set ownership to root:root on $file"
+        else
+            local error_msg=$(cat /tmp/chown_error)
+            log_message "ERROR: Failed to set ownership on $file - Error: $error_msg"
+            rm -f /tmp/chown_error
+            return 1
+        fi
+    done
+
+    # Verify configuration
+    if grep -q "sshd : ALL : ALLOW" /etc/hosts.allow && grep -q "ALL: LOCAL, 127.0.0.1" /etc/hosts.allow && grep -q "ALL: ALL" /etc/hosts.deny; then
+        log_message "INFO: Verified TCP Wrappers configuration"
+    else
+        log_message "WARNING: TCP Wrappers configuration not fully applied as expected"
+    fi
+    rm -f /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/cp_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_hosts

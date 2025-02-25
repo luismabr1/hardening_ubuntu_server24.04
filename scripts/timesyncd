@@ -1,92 +1,277 @@
-function f_timesyncd {
-  echo "[$SCRIPT_COUNT] Systemd/timesyncd.conf"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+# HOSTS_EQUIV='/etc/hosts.equiv'
+# SECURETTY='/etc/securetty'
+# DEBUG_SHELL_SERVICE='debug-shell.service'
+# SSH_MODULI='/etc/ssh/moduli'
+# SSH_SERVICE='ssh.service'
+# SUDOERS_DIR='/etc/sudoers.d'
+# PAM_SU='/etc/pam.d/su'
+# SUDO_LOG='/var/log/sudo.log'
+# SUID_LIST='./misc/suid.list'
+# SHELLS_FILE='/etc/shells'
+# SYSCTL_SERVICE='systemd-sysctl.service'
+# ARPBIN='/usr/sbin/arp'
+# TIMESYNCD='/etc/systemd/timesyncd.conf'
+# NTPSERVERPOOL='0.ubuntu.pool.ntp.org 1.ubuntu.pool.ntp.org 2.ubuntu.pool.ntp.org 3.ubuntu.pool.ntp.org pool.ntp.org'
+# TIMEDATECTL=''
 
-  local LATENCY
-  local SERVERS
-  local SERVERARRAY
-  local FALLBACKARRAY
-  local TMPCONF
+# New variables to add to global variables file:
+# PINGBIN='/bin/ping'              # Path to ping binary, used for latency checks
+# DIGBIN='/usr/bin/dig'            # Path to dig binary, used for DNS resolution
+# TIMESYNCD_SERVICE='systemd-timesyncd.service'  # Defines timesyncd service name for consistency
 
-  APPLY="YES"
-  CONF="$TIMESYNCD"
-  FALLBACKARRAY=()
-  FALLBACKSERV=0
-  LATENCY="50"
-  NUMSERV=0
-  SERVERARRAY=()
-  SERVERS="4"
-  TMPCONF=$(mktemp --tmpdir ntpconf.XXXXX)
-
-  if [[ -z "$NTPSERVERPOOL" ]]; then
-    local NTPSERVERPOOL
-    NTPSERVERPOOL="0.ubuntu.pool.ntp.org 1.ubuntu.pool.ntp.org 2.ubuntu.pool.ntp.org 3.ubuntu.pool.ntp.org pool.ntp.org"
-  fi
-
-  echo "[Time]" > "$TMPCONF"
-
-  PONG="${PINGBIN} -c2"
-
-  # shellcheck disable=2086
-  while read -r s; do
-    if [[ $NUMSERV -ge $SERVERS ]]; then
-      break
-    fi
-
-    local PINGSERV
-    PINGSERV=$($PONG "$s" | grep 'rtt min/avg/max/mdev' | awk -F "/" '{printf "%.0f\n",$6}')
-    if [[ $PINGSERV -gt "1" && $PINGSERV -lt "$LATENCY" ]]; then
-      OKSERV=$(nslookup "$s"|grep "name = " | awk '{print $4}'|sed 's/.$//')
-      # shellcheck disable=2143
-      # shellcheck disable=2243
-      # shellcheck disable=2244
-      if [[ $OKSERV && $NUMSERV -lt $SERVERS && ! (( $(grep "$OKSERV" "$TMPCONF") )) ]]; then
-        echo "$OKSERV has latency < $LATENCY"
-        SERVERARRAY+=("$OKSERV")
-        ((NUMSERV++))
-      fi
-    fi
-  done <<< "$(${DIGBIN} +noall +answer +nocomments $NTPSERVERPOOL | awk '{print $5}')"
-
-  for l in $NTPSERVERPOOL; do
-    if [[ $FALLBACKSERV -le "2" ]]; then
-      FALLBACKARRAY+=("$l")
-      ((FALLBACKSERV++))
-    else
-      break
-    fi
-  done
-
-  if [[ ${#SERVERARRAY[@]} -le "2" ]]; then
-    for s in $(echo "$NTPSERVERPOOL" | awk '{print $(NF-1),$NF}'); do
-      SERVERARRAY+=("$s")
-    done
-  fi
-
-  {
-    echo "NTP=${SERVERARRAY[*]}"
-    echo "FallbackNTP=${FALLBACKARRAY[*]}"
-    echo "RootDistanceMaxSec=1"
-  } >> "$TMPCONF"
-
-  if [[ $APPLY = "YES" ]]; then
-    cat "$TMPCONF" > "$CONF"
-    systemctl restart systemd-timesyncd
-    rm "$TMPCONF"
-  else
-    echo "Configuration saved to $TMPCONF."
-  fi
-
-  if [[ -n "$TIMEDATECTL" ]]; then
-    echo "Setting time zone to $TIMEDATECTL"
-    timedatectl set-timezone "$TIMEDATECTL"
-  fi
-
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status systemd-timesyncd --no-pager
-    echo
-    timedatectl
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_timesyncd {
+    echo "[$SCRIPT_COUNT] Configuring $TIMESYNCD for time synchronization"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure required packages are installed (coreutils, iputils-ping, bind9-dnsutils, systemd)
+    local required_pkgs=("coreutils" "iputils-ping" "bind9-dnsutils" "systemd")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg not found, required for timesyncd configuration"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+
+    # Backup timesyncd.conf
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "$TIMESYNCD" ]]; then
+        if cp "$TIMESYNCD" "$BACKUP_DIR/timesyncd.conf.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $TIMESYNCD to $BACKUP_DIR/timesyncd.conf.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $TIMESYNCD - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    fi
+
+    # Initialize variables
+    local LATENCY="50"
+    local SERVERS="4"
+    local APPLY="YES"
+    local NUMSERV=0
+    local FALLBACKSERV=0
+    local SERVERARRAY=()
+    local FALLBACKARRAY=()
+    local TMPCONF
+    TMPCONF=$(mktemp --tmpdir ntpconf.XXXXX 2>/tmp/mktemp_error)
+    if [[ $? -eq 0 ]]; then
+        log_message "INFO: Created temporary config file at $TMPCONF"
+    else
+        local error_msg=$(cat /tmp/mktemp_error)
+        log_message "ERROR: Failed to create temporary config file - Error: $error_msg"
+        rm -f /tmp/mktemp_error
+        return 1
+    fi
+
+    # Set default NTPSERVERPOOL if empty
+    if [[ -z "$NTPSERVERPOOL" ]]; then
+        NTPSERVERPOOL="0.ubuntu.pool.ntp.org 1.ubuntu.pool.ntp.org 2.ubuntu.pool.ntp.org 3.ubuntu.pool.ntp.org pool.ntp.org"
+        log_message "INFO: NTPSERVERPOOL was empty, set to default: $NTPSERVERPOOL"
+    fi
+
+    # Write initial [Time] section to TMPCONF
+    if echo "[Time]" > "$TMPCONF" 2>/tmp/echo_error; then
+        log_message "INFO: Wrote [Time] section to $TMPCONF"
+    else
+        local error_msg=$(cat /tmp/echo_error)
+        log_message "ERROR: Failed to write [Time] section to $TMPCONF - Error: $error_msg"
+        rm -f /tmp/echo_error "$TMPCONF"
+        return 1
+    fi
+
+    # Select NTP servers based on latency (CIS 2.2.1.1)
+    local PONG="${PINGBIN} -c2"
+    local server_resolved
+    server_resolved=$($DIGBIN +noall +answer +nocomments $NTPSERVERPOOL | awk '{print $5}' 2>/tmp/dig_error)
+    if [[ $? -eq 0 ]]; then
+        while read -r s; do
+            if [[ $NUMSERV -ge $SERVERS ]]; then
+                log_message "INFO: Reached maximum server limit ($SERVERS), stopping server selection"
+                break
+            fi
+            if [[ -n "$s" ]]; then
+                local PINGSERV
+                PINGSERV=$($PONG "$s" | grep 'rtt min/avg/max/mdev' | awk -F "/" '{printf "%.0f\n",$6}' 2>/tmp/ping_error)
+                if [[ $? -eq 0 && $PINGSERV -gt 1 && $PINGSERV -lt $LATENCY ]]; then
+                    local OKSERV
+                    OKSERV=$(nslookup "$s" 2>/tmp/nslookup_error | grep "name = " | awk '{print $4}' | sed 's/\.$//')
+                    if [[ $? -eq 0 && -n "$OKSERV" && $NUMSERV -lt $SERVERS && ! $(grep -q "$OKSERV" "$TMPCONF" 2>/dev/null) ]]; then
+                        log_message "INFO: $OKSERV has latency < $LATENCY ms ($PINGSERV ms), adding to NTP servers"
+                        SERVERARRAY+=("$OKSERV")
+                        ((NUMSERV++))
+                    fi
+                fi
+            fi
+        done <<< "$server_resolved"
+        log_message "INFO: Selected $NUMSERV NTP servers based on latency: ${SERVERARRAY[*]}"
+    else
+        local error_msg=$(cat /tmp/dig_error)
+        log_message "WARNING: Failed to resolve NTP servers with $DIGBIN - Error: $error_msg, proceeding with defaults"
+    fi
+
+    # Select fallback NTP servers
+    for l in $NTPSERVERPOOL; do
+        if [[ $FALLBACKSERV -le 2 ]]; then
+            FALLBACKARRAY+=("$l")
+            ((FALLBACKSERV++))
+        else
+            break
+        fi
+    done
+    log_message "INFO: Selected $FALLBACKSERV fallback NTP servers: ${FALLBACKARRAY[*]}"
+
+    # Ensure minimum NTP servers
+    if [[ ${#SERVERARRAY[@]} -le 2 ]]; then
+        local extra_servers
+        extra_servers=$(echo "$NTPSERVERPOOL" | awk '{print $(NF-1),$NF}')
+        for s in $extra_servers; do
+            if [[ ! " ${SERVERARRAY[*]} " =~ " $s " ]]; then
+                SERVERARRAY+=("$s")
+                log_message "INFO: Added $s to NTP servers as fewer than 2 were selected"
+            fi
+        done
+    fi
+
+    # Write final settings to TMPCONF
+    local time_settings=(
+        "NTP=${SERVERARRAY[*]}"
+        "FallbackNTP=${FALLBACKARRAY[*]}"
+        "RootDistanceMaxSec=1"
+    )
+    for setting in "${time_settings[@]}"; do
+        if echo "$setting" >> "$TMPCONF" 2>/tmp/echo_error; then
+            log_message "INFO: Added '$setting' to $TMPCONF"
+        else
+            local error_msg=$(cat /tmp/echo_error)
+            log_message "ERROR: Failed to add '$setting' to $TMPCONF - Error: $error_msg"
+            rm -f /tmp/echo_error "$TMPCONF"
+            return 1
+        fi
+    done
+
+    # Apply configuration if APPLY=YES
+    if [[ "$APPLY" == "YES" ]]; then
+        if cat "$TMPCONF" > "$TIMESYNCD" 2>/tmp/cat_error; then
+            log_message "INFO: Applied temporary config from $TMPCONF to $TIMESYNCD"
+            if systemctl restart systemd-timesyncd.service 2>/tmp/timesyncd_restart_error; then
+                log_message "INFO: Successfully restarted systemd-timesyncd.service"
+            else
+                local error_msg=$(cat /tmp/timesyncd_restart_error)
+                log_message "ERROR: Failed to restart systemd-timesyncd.service - Error: $error_msg"
+                rm -f /tmp/timesyncd_restart_error "$TMPCONF"
+                return 1
+            fi
+            if rm "$TMPCONF" 2>/tmp/rm_error; then
+                log_message "INFO: Removed temporary config file $TMPCONF"
+            else
+                local error_msg=$(cat /tmp/rm_error)
+                log_message "WARNING: Failed to remove temporary config file $TMPCONF - Error: $error_msg"
+            fi
+        else
+            local error_msg=$(cat /tmp/cat_error)
+            log_message "ERROR: Failed to apply $TMPCONF to $TIMESYNCD - Error: $error_msg"
+            rm -f /tmp/cat_error "$TMPCONF"
+            return 1
+        fi
+    else
+        log_message "INFO: Configuration saved to $TMPCONF without applying"
+        echo "Configuration saved to $TMPCONF."
+    fi
+
+    # Set timezone if TIMEDATECTL is specified
+    if [[ -n "$TIMEDATECTL" ]]; then
+        if timedatectl set-timezone "$TIMEDATECTL" 2>/tmp/timedatectl_error; then
+            log_message "INFO: Set timezone to $TIMEDATECTL"
+        else
+            local error_msg=$(cat /tmp/timedatectl_error)
+            log_message "ERROR: Failed to set timezone to $TIMEDATECTL - Error: $error_msg"
+            rm -f /tmp/timedatectl_error
+            return 1
+        fi
+    fi
+
+    # Verify configuration
+    local verified=true
+    if [[ "$APPLY" == "YES" ]]; then
+        local settings_to_check=(
+            "NTP=${SERVERARRAY[*]}"
+            "FallbackNTP=${FALLBACKARRAY[*]}"
+            "RootDistanceMaxSec=1"
+        )
+        for setting in "${settings_to_check[@]}"; do
+            if ! grep -q "^$setting" "$TIMESYNCD" 2>/dev/null; then
+                log_message "WARNING: Setting '$setting' not found in $TIMESYNCD as expected"
+                verified=false
+            fi
+        done
+        if systemctl is-active systemd-timesyncd.service >/dev/null 2>&1; then
+            log_message "INFO: Verified systemd-timesyncd.service is active"
+        else
+            log_message "WARNING: systemd-timesyncd.service is not active after restart"
+            verified=false
+        fi
+        if [[ "$verified" == "true" ]]; then
+            log_message "INFO: Verified all timesyncd configuration settings"
+        fi
+    fi
+    if [[ -n "$TIMEDATECTL" ]]; then
+        if timedatectl show | grep -q "Timezone=$TIMEDATECTL"; then
+            log_message "INFO: Verified timezone is set to $TIMEDATECTL"
+        else
+            log_message "WARNING: Timezone not set to $TIMEDATECTL as expected"
+        fi
+    fi
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status systemd-timesyncd.service --no-pager
+        echo
+        timedatectl
+        echo
+    fi
+    rm -f /tmp/ping_error /tmp/nslookup_error /tmp/echo_error /tmp/cat_error /tmp/timesyncd_restart_error /tmp/rm_error /tmp/timedatectl_error /tmp/mktemp_error /tmp/dig_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_timesyncd

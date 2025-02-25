@@ -1,18 +1,126 @@
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
 function f_issue {
-  echo "[$SCRIPT_COUNT] /etc/issue"
+    echo "[$SCRIPT_COUNT] Configuring warning banners in /etc/issue, /etc/issue.net, and /etc/motd"
 
-  local TEXT
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
 
-  for f in /etc/issue /etc/issue.net /etc/motd; do
-    TEXT="\\nBy accessing this system, you consent to the following conditions:
+    # Ensure coreutils is installed (for chmod, echo -e, etc.)
+    if ! dpkg -l | grep -q "^ii.*coreutils"; then
+        log_message "WARNING: coreutils package not found, required for file operations"
+        log_message "INFO: Attempting to install coreutils"
+        if $APT install -y coreutils 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed coreutils"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install coreutils - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: coreutils package is already installed"
+    fi
+    rm -f /tmp/apt_install_error
+
+    # Backup existing banner files
+    local files=("/etc/issue" "/etc/issue.net" "/etc/motd")
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        fi
+    done
+
+    # Define warning banner text (CIS 1.7.1, NIST AC-8)
+    local TEXT="\\nBy accessing this system, you consent to the following conditions:
 - This system is for authorized use only.
 - Any or all uses of this system and all files on this system may be monitored.
-- Communications using, or data stored on, this system are not private.
-"
-    echo -e "$TEXT" > $f
-  done
+- Communications using, or data stored on, this system are not private."
 
-  chmod a-x /etc/update-motd.d/*
+    # Update banner files
+    for f in "${files[@]}"; do
+        if echo -e "$TEXT" > "$f" 2>/tmp/echo_error; then
+            log_message "INFO: Updated $f with warning banner"
+        else
+            local error_msg=$(cat /tmp/echo_error)
+            log_message "ERROR: Failed to update $f with warning banner - Error: $error_msg"
+            rm -f /tmp/echo_error
+            return 1
+        fi
+        # Set secure permissions (CIS 1.7.1 recommends readable but not writable by others)
+        if chmod 0644 "$f" 2>/tmp/chmod_error; then
+            log_message "INFO: Set permissions to 0644 on $f"
+        else
+            local error_msg=$(cat /tmp/chmod_error)
+            log_message "ERROR: Failed to set permissions on $f - Error: $error_msg"
+            rm -f /tmp/chmod_error
+            return 1
+        fi
+        if chown root:root "$f" 2>/tmp/chown_error; then
+            log_message "INFO: Set ownership to root:root on $f"
+        else
+            local error_msg=$(cat /tmp/chown_error)
+            log_message "ERROR: Failed to set ownership on $f - Error: $error_msg"
+            rm -f /tmp/chown_error
+            return 1
+        fi
+    done
 
-  ((SCRIPT_COUNT++))
+    # Disable dynamic MOTD updates (CIS 1.7.2)
+    local motd_dir="/etc/update-motd.d"
+    if [[ -d "$motd_dir" ]]; then
+        if chmod a-x "$motd_dir"/* 2>/tmp/chmod_error; then
+            log_message "INFO: Removed execute permissions from scripts in $motd_dir"
+        else
+            local error_msg=$(cat /tmp/chmod_error)
+            log_message "WARNING: Failed to remove execute permissions from some scripts in $motd_dir - Error: $error_msg"
+            # Not critical, continue execution
+        fi
+    else
+        log_message "INFO: $motd_dir not found, no dynamic MOTD scripts to disable"
+    fi
+
+    # Verify banner configuration
+    local verified=true
+    for f in "${files[@]}"; do
+        if ! grep -q "This system is for authorized use only" "$f" 2>/dev/null; then
+            log_message "WARNING: Warning banner not fully applied to $f"
+            verified=false
+        fi
+    done
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified warning banners applied to all target files"
+    fi
+    rm -f /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/cp_error
+
+    ((SCRIPT_COUNT++))
 }
+
+# Example usage (assuming part of larger script)
+# f_issue

@@ -1,18 +1,154 @@
-function f_limitsconf {
-  echo "[$SCRIPT_COUNT] $LIMITSCONF"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LIMITSCONF='/etc/security/limits.conf'
 
-  sed -i 's/^# End of file*//' "$LIMITSCONF"
-  { echo '* hard maxlogins 10'
-    echo '* hard core 0'
-    echo '* soft nproc 512'
-    echo '* hard nproc 1024'
-    echo '# End of file'
-  } >> "$LIMITSCONF"
-
-  if [[ $VERBOSE == "Y" ]]; then
-    grep -v '#' "$LIMITSCONF" | uniq
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_limitsconf {
+    echo "[$SCRIPT_COUNT] Configuring resource limits in $LIMITSCONF"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure pam_limits is installed (part of libpam-modules)
+    if ! dpkg -l | grep -q "^ii.*libpam-modules"; then
+        log_message "WARNING: libpam-modules package not found, required for limits.conf enforcement"
+        log_message "INFO: Attempting to install libpam-modules"
+        if $APT install -y libpam-modules 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed libpam-modules"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install libpam-modules - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: libpam-modules package is already installed"
+    fi
+    rm -f /tmp/apt_install_error
+
+    # Backup limits.conf
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "$LIMITSCONF" ]]; then
+        if cp "$LIMITSCONF" "$BACKUP_DIR/limits.conf.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $LIMITSCONF to $BACKUP_DIR/limits.conf.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $LIMITSCONF - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    else
+        log_message "WARNING: $LIMITSCONF not found, creating it"
+        touch "$LIMITSCONF" || {
+            log_message "ERROR: Failed to create $LIMITSCONF"
+            return 1
+        }
+    fi
+
+    # Ensure file is writable
+    if [[ ! -w "$LIMITSCONF" ]]; then
+        log_message "ERROR: $LIMITSCONF is not writable"
+        return 1
+    fi
+
+    # Remove existing # End of file marker
+    if sed -i 's|^# End of file||' "$LIMITSCONF" 2>/tmp/sed_error; then
+        log_message "INFO: Removed '# End of file' marker from $LIMITSCONF"
+    else
+        local error_msg=$(cat /tmp/sed_error)
+        log_message "ERROR: Failed to remove '# End of file' from $LIMITSCONF - Error: $error_msg"
+        rm -f /tmp/sed_error
+        return 1
+    fi
+
+    # Define resource limits (CIS 5.4.4, NIST CM-7)
+    local limits=(
+        "* hard maxlogins 10"  # Limit logins to 10
+        "* hard core 0"        # Disable core dumps
+        "* soft nproc 512"     # Soft process limit
+        "* hard nproc 1024"    # Hard process limit
+        "# End of file"        # End marker
+    )
+    local temp_file=$(mktemp --tmpdir limits.XXXXX)
+    if [[ ! -f "$temp_file" ]]; then
+        log_message "ERROR: Failed to create temporary file for limits"
+        return 1
+    fi
+
+    # Write limits to temp file and append
+    for limit in "${limits[@]}"; do
+        echo "$limit" >> "$temp_file" 2>/tmp/echo_error || {
+            local error_msg=$(cat /tmp/echo_error)
+            log_message "ERROR: Failed to write '$limit' to temp file - Error: $error_msg"
+            rm -f /tmp/echo_error "$temp_file"
+            return 1
+        }
+    done
+    if cat "$temp_file" >> "$LIMITSCONF" 2>/tmp/cat_error; then
+        log_message "INFO: Appended resource limits to $LIMITSCONF"
+        rm -f "$temp_file"
+    else
+        local error_msg=$(cat /tmp/cat_error)
+        log_message "ERROR: Failed to append limits to $LIMITSCONF - Error: $error_msg"
+        rm -f /tmp/cat_error "$temp_file"
+        return 1
+    fi
+
+    # Set secure permissions (CIS 5.4.4 recommends 0644)
+    if chmod 0644 "$LIMITSCONF" 2>/tmp/chmod_error; then
+        log_message "INFO: Set permissions to 0644 on $LIMITSCONF"
+    else
+        local error_msg=$(cat /tmp/chmod_error)
+        log_message "ERROR: Failed to set permissions on $LIMITSCONF - Error: $error_msg"
+        rm -f /tmp/chmod_error
+        return 1
+    fi
+    if chown root:root "$LIMITSCONF" 2>/tmp/chown_error; then
+        log_message "INFO: Set ownership to root:root on $LIMITSCONF"
+    else
+        local error_msg=$(cat /tmp/chown_error)
+        log_message "ERROR: Failed to set ownership on $LIMITSCONF - Error: $error_msg"
+        rm -f /tmp/chown_error
+        return 1
+    fi
+
+    # Verify configuration
+    local verified=true
+    for limit in "maxlogins 10" "core 0" "nproc 512" "nproc 1024"; do
+        if ! grep -q "$limit" "$LIMITSCONF" 2>/dev/null; then
+            log_message "WARNING: Limit '$limit' not found in $LIMITSCONF"
+            verified=false
+        fi
+    done
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified all resource limits applied to $LIMITSCONF"
+    fi
+
+    # Show active limits if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        grep -v '#' "$LIMITSCONF" | uniq
+        echo
+    fi
+    rm -f /tmp/sed_error /tmp/echo_error /tmp/cat_error /tmp/chmod_error /tmp/chown_error /tmp/cp_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_limitsconf

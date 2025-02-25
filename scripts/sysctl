@@ -1,25 +1,201 @@
-function f_sysctl {
-  if [[ $LXC == "1" ]]; then
-    return
-  fi
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+# HOSTS_EQUIV='/etc/hosts.equiv'
+# SECURETTY='/etc/securetty'
+# DEBUG_SHELL_SERVICE='debug-shell.service'
+# SSH_MODULI='/etc/ssh/moduli'
+# SSH_SERVICE='ssh.service'
+# SUDOERS_DIR='/etc/sudoers.d'
+# PAM_SU='/etc/pam.d/su'
+# SUDO_LOG='/var/log/sudo.log'
+# SUID_LIST='./misc/suid.list'
+# SHELLS_FILE='/etc/shells'
+# SYSCTL_CONF='./misc/sysctl.conf'
+# SYSCTL='/etc/sysctl.conf'
+# ARPBIN='/usr/sbin/arp'  # Assuming this is defined; if not, added below
 
-  echo "[$SCRIPT_COUNT] $SYSCTL"
+# New variables to add to global variables file:
+# SYSCTL_SERVICE='systemd-sysctl.service'  # Defines systemd-sysctl service name for consistency
+# ARPBIN='/usr/sbin/arp'                   # Path to arp binary, added if not already present (assumed in original)
 
-  cp "$SYSCTL_CONF" "$SYSCTL"
-
-  sed -i '/net.ipv6.conf.eth0.accept_ra_rtr_pref/d' "$SYSCTL"
-
-  for n in $($ARPBIN -n -a | awk '{print $NF}' | sort | uniq); do
-    echo "net.ipv6.conf.$n.accept_ra_rtr_pref = 0" >> "$SYSCTL"
-  done
-
-  chmod 0600 "$SYSCTL"
-  systemctl restart systemd-sysctl
-
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status systemd-sysctl --no-pager
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_sysctl {
+    # Skip if running in LXC environment
+    if [[ "$LXC" == "1" ]]; then
+        log_message "INFO: Skipping sysctl configuration in LXC environment"
+        return 0
+    fi
+
+    echo "[$SCRIPT_COUNT] Configuring $SYSCTL for kernel parameter security"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure required packages are installed (coreutils for sed, arp for network interface detection, systemd for sysctl service)
+    local required_pkgs=("coreutils" "net-tools" "systemd")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg not found, required for sysctl configuration"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+
+    # Backup sysctl.conf
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "$SYSCTL" ]]; then
+        if cp "$SYSCTL" "$BACKUP_DIR/sysctl.conf.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $SYSCTL to $BACKUP_DIR/sysctl.conf.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $SYSCTL - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    fi
+
+    # Copy SYSCTL_CONF to SYSCTL
+    if [[ -f "$SYSCTL_CONF" ]]; then
+        if cp "$SYSCTL_CONF" "$SYSCTL" 2>/tmp/cp_error; then
+            log_message "INFO: Copied $SYSCTL_CONF to $SYSCTL"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to copy $SYSCTL_CONF to $SYSCTL - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    else
+        log_message "ERROR: $SYSCTL_CONF not found, cannot configure sysctl"
+        return 1
+    fi
+
+    # Ensure SYSCTL is writable
+    if [[ ! -w "$SYSCTL" ]]; then
+        log_message "ERROR: $SYSCTL is not writable"
+        return 1
+    fi
+
+    # Remove specific IPv6 setting
+    if sed -i '/net.ipv6.conf.eth0.accept_ra_rtr_pref/d' "$SYSCTL" 2>/tmp/sed_error; then
+        log_message "INFO: Removed net.ipv6.conf.eth0.accept_ra_rtr_pref from $SYSCTL"
+    else
+        local error_msg=$(cat /tmp/sed_error)
+        log_message "ERROR: Failed to remove net.ipv6.conf.eth0.accept_ra_rtr_pref from $SYSCTL - Error: $error_msg"
+        rm -f /tmp/sed_error
+        return 1
+    fi
+
+    # Append IPv6 settings for network interfaces (CIS 3.2.1)
+    local interfaces
+    interfaces=$($ARPBIN -n -a 2>/tmp/arp_error | awk '{print $NF}' | sort | uniq)
+    if [[ $? -eq 0 ]]; then
+        local interface_count=0
+        for n in $interfaces; do
+            if echo "net.ipv6.conf.$n.accept_ra_rtr_pref = 0" >> "$SYSCTL" 2>/tmp/echo_error; then
+                log_message "INFO: Added 'net.ipv6.conf.$n.accept_ra_rtr_pref = 0' to $SYSCTL"
+                ((interface_count++))
+            else
+                local error_msg=$(cat /tmp/echo_error)
+                log_message "ERROR: Failed to add 'net.ipv6.conf.$n.accept_ra_rtr_pref = 0' to $SYSCTL - Error: $error_msg"
+                rm -f /tmp/echo_error
+                return 1
+            fi
+        done
+        log_message "INFO: Configured $interface_count network interfaces in $SYSCTL"
+    else
+        local error_msg=$(cat /tmp/arp_error)
+        log_message "WARNING: Failed to retrieve network interfaces with $ARPBIN - Error: $error_msg"
+    fi
+
+    # Set permissions on SYSCTL
+    if chmod 0600 "$SYSCTL" 2>/tmp/chmod_error; then
+        log_message "INFO: Set permissions to 0600 on $SYSCTL"
+    else
+        local error_msg=$(cat /tmp/chmod_error)
+        log_message "ERROR: Failed to set permissions on $SYSCTL - Error: $error_msg"
+        rm -f /tmp/chmod_error
+        return 1
+    fi
+    if chown root:root "$SYSCTL" 2>/tmp/chown_error; then
+        log_message "INFO: Set ownership to root:root on $SYSCTL"
+    else
+        local error_msg=$(cat /tmp/chown_error)
+        log_message "ERROR: Failed to set ownership on $SYSCTL - Error: $error_msg"
+        rm -f /tmp/chown_error
+        return 1
+    fi
+
+    # Restart systemd-sysctl service
+    if systemctl restart systemd-sysctl.service 2>/tmp/sysctl_restart_error; then
+        log_message "INFO: Successfully restarted systemd-sysctl.service"
+    else
+        local error_msg=$(cat /tmp/sysctl_restart_error)
+        log_message "ERROR: Failed to restart systemd-sysctl.service - Error: $error_msg"
+        rm -f /tmp/sysctl_restart_error
+        return 1
+    fi
+
+    # Verify key sysctl settings
+    local verified=true
+    if [[ $interface_count -gt 0 ]]; then
+        for n in $interfaces; do
+            if ! grep -q "^net.ipv6.conf.$n.accept_ra_rtr_pref = 0" "$SYSCTL" 2>/dev/null; then
+                log_message "WARNING: Setting 'net.ipv6.conf.$n.accept_ra_rtr_pref = 0' not found in $SYSCTL"
+                verified=false
+            fi
+        done
+    fi
+    if systemctl is-active systemd-sysctl.service >/dev/null 2>&1; then
+        log_message "INFO: Verified systemd-sysctl.service is active"
+    else
+        log_message "WARNING: systemd-sysctl.service is not active after restart"
+        verified=false
+    fi
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified key sysctl configuration settings"
+    fi
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status systemd-sysctl.service --no-pager
+        echo
+    fi
+    rm -f /tmp/sed_error /tmp/echo_error /tmp/arp_error /tmp/chmod_error /tmp/chown_error /tmp/sysctl_restart_error /tmp/cp_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_sysctl

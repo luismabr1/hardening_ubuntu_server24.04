@@ -1,13 +1,126 @@
-function f_disablemod {
-  echo "[$SCRIPT_COUNT] Disable misc kernel modules"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# DISABLEMOD='/etc/modprobe.d/disablemod.conf'
+# APT='apt-get'
 
-  local MOD
-  MOD="bluetooth bnep btusb cpia2 firewire-core floppy n_hdlc net-pf-31 pcspkr soundcore thunderbolt usb-midi usb-storage uvcvideo v4l2_common"
-  for disable in $MOD; do
-    if ! grep -q "$disable" "$DISABLEMOD" 2> /dev/null; then
-      echo "install $disable /bin/true" >> "$DISABLEMOD"
-    fi
-  done
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_disablemod {
+    echo "[$SCRIPT_COUNT] Disabling miscellaneous kernel modules"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure modprobe is available (part of kmod package)
+    if ! command -v modprobe >/dev/null 2>&1; then
+        log_message "WARNING: kmod package not found, required for module disabling"
+        log_message "INFO: Attempting to install kmod"
+        if $APT install -y kmod 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed kmod"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install kmod - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: kmod package is already installed"
+    fi
+    rm -f /tmp/apt_install_error
+
+    # Backup DISABLEMOD file if it exists
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "$DISABLEMOD" ]]; then
+        if cp "$DISABLEMOD" "$BACKUP_DIR/disablemod.conf.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $DISABLEMOD to $BACKUP_DIR/disablemod.conf.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $DISABLEMOD - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    fi
+
+    # Ensure DISABLEMOD directory exists and file is writable
+    mkdir -p "$(dirname "$DISABLEMOD")" || {
+        log_message "ERROR: Failed to create directory $(dirname "$DISABLEMOD")"
+        return 1
+    }
+    if [[ ! -f "$DISABLEMOD" ]]; then
+        touch "$DISABLEMOD" || {
+            log_message "ERROR: Failed to create $DISABLEMOD"
+            return 1
+        }
+    fi
+    if [[ ! -w "$DISABLEMOD" ]]; then
+        log_message "ERROR: $DISABLEMOD is not writable"
+        return 1
+    fi
+
+    # List of kernel modules to disable (CIS 1.1.2, NIST CM-7)
+    local MOD="bluetooth bnep btusb cpia2 firewire-core floppy n_hdlc net-pf-31 pcspkr soundcore thunderbolt usb-midi usb-storage uvcvideo v4l2_common"
+    local disabled_count=0
+    for disable in $MOD; do
+        if ! grep -q "^install $disable /bin/true" "$DISABLEMOD" 2>/tmp/grep_error; then
+            if echo "install $disable /bin/true" >> "$DISABLEMOD" 2>/tmp/echo_error; then
+                log_message "INFO: Disabled $disable kernel module in $DISABLEMOD"
+                ((disabled_count++))
+            else
+                local error_msg=$(cat /tmp/echo_error)
+                log_message "ERROR: Failed to disable $disable in $DISABLEMOD - Error: $error_msg"
+                rm -f /tmp/echo_error
+                return 1
+            fi
+        else
+            log_message "INFO: $disable kernel module already disabled in $DISABLEMOD"
+        fi
+    done
+
+    # Set secure permissions on DISABLEMOD (CIS 1.1.2)
+    if chmod 0640 "$DISABLEMOD" 2>/tmp/chmod_error; then
+        log_message "INFO: Set secure permissions (0640) on $DISABLEMOD"
+    else
+        local error_msg=$(cat /tmp/chmod_error)
+        log_message "ERROR: Failed to set permissions on $DISABLEMOD - Error: $error_msg"
+        rm -f /tmp/chmod_error
+        return 1
+    fi
+    if chown root:root "$DISABLEMOD" 2>/tmp/chown_error; then
+        log_message "INFO: Set ownership to root:root on $DISABLEMOD"
+    else
+        local error_msg=$(cat /tmp/chown_error)
+        log_message "ERROR: Failed to set ownership on $DISABLEMOD - Error: $error_msg"
+        rm -f /tmp/chown_error
+        return 1
+    fi
+
+    # Apply changes by updating modules (recommended for immediate effect)
+    if update-initramfs -u 2>/tmp/initramfs_error; then
+        log_message "INFO: Updated initramfs to apply module disable changes (reboot recommended)"
+    else
+        local error_msg=$(cat /tmp/initramfs_error)
+        log_message "WARNING: Failed to update initramfs - Error: $error_msg - Changes apply on next reboot"
+    fi
+    rm -f /tmp/grep_error /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/initramfs_error /tmp/cp_error
+
+    log_message "INFO: Successfully disabled $disabled_count kernel modules"
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_disablemod

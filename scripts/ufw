@@ -1,38 +1,209 @@
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+# HOSTS_EQUIV='/etc/hosts.equiv'
+# SECURETTY='/etc/securetty'
+# DEBUG_SHELL_SERVICE='debug-shell.service'
+# SSH_MODULI='/etc/ssh/moduli'
+# SSH_SERVICE='ssh.service'
+# SUDOERS_DIR='/etc/sudoers.d'
+# PAM_SU='/etc/pam.d/su'
+# SUDO_LOG='/var/log/sudo.log'
+# SUID_LIST='./misc/suid.list'
+# SHELLS_FILE='/etc/shells'
+# SYSCTL_SERVICE='systemd-sysctl.service'
+# ARPBIN='/usr/sbin/arp'
+# PINGBIN='/bin/ping'
+# DIGBIN='/usr/bin/dig'
+# TIMESYNCD_SERVICE='systemd-timesyncd.service'
+# UFWDEFAULT='/etc/default/ufw'
+# FW_ADMIN='127.0.0.1'
+# SSH_PORT='22'
+
+# New variables to add to global variables file:
+# UFW_SERVICE='ufw.service'  # Defines UFW service name for consistency
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
 function f_firewall {
-  echo "[$SCRIPT_COUNT] Enable ufw"
+    echo "[$SCRIPT_COUNT] Enabling and configuring UFW firewall"
 
-  if ! test -f "$UFWDEFAULT"; then
-    echo "$UFWDEFAULT does not exist."
-
-    if ! dpkg -l | grep ufw 2> /dev/null 1>&2; then
-      echo 'ufw package is not installed.'
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
     fi
 
-    return
-  fi
+    # Ensure ufw is installed
+    if ! dpkg -l | grep -q "^ii.*ufw" 2>/tmp/dpkg_error; then
+        log_message "WARNING: ufw package is not installed"
+        echo "ufw package is not installed."
+        log_message "INFO: Attempting to install ufw"
+        if $APT install -y ufw 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed ufw"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install ufw - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: ufw package is already installed"
+    fi
 
-  sed -i 's/IPT_SYSCTL=.*/IPT_SYSCTL=\/etc\/sysctl\.conf/' "$UFWDEFAULT"
+    # Check if UFWDEFAULT exists
+    if [[ ! -f "$UFWDEFAULT" ]]; then
+        log_message "ERROR: $UFWDEFAULT does not exist, cannot configure UFW"
+        echo "$UFWDEFAULT does not exist."
+        local dpkg_error=$(cat /tmp/dpkg_error 2>/dev/null)
+        [[ -n "$dpkg_error" ]] && log_message "WARNING: dpkg check failed - Error: $dpkg_error"
+        rm -f /tmp/dpkg_error
+        return 1
+    fi
+    rm -f /tmp/dpkg_error
 
-  ufw allow in on lo
-  ufw allow out on lo
-  ufw deny in from 127.0.0.0/8
-  ufw deny in from ::1
+    # Backup UFWDEFAULT
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if cp "$UFWDEFAULT" "$BACKUP_DIR/ufw.$TIMESTAMP" 2>/tmp/cp_error; then
+        log_message "INFO: Backed up $UFWDEFAULT to $BACKUP_DIR/ufw.$TIMESTAMP"
+    else
+        local error_msg=$(cat /tmp/cp_error)
+        log_message "ERROR: Failed to backup $UFWDEFAULT - Error: $error_msg"
+        rm -f /tmp/cp_error
+        return 1
+    fi
 
-  ufw logging on
+    # Ensure UFWDEFAULT is writable
+    if [[ ! -w "$UFWDEFAULT" ]]; then
+        log_message "ERROR: $UFWDEFAULT is not writable"
+        return 1
+    fi
 
-  ufw default deny incoming
+    # Configure UFWDEFAULT (CIS 3.4.1)
+    if sed -i 's|^[#]*IPT_SYSCTL=.*|IPT_SYSCTL=/etc/sysctl.conf|' "$UFWDEFAULT" 2>/tmp/sed_error; then
+        log_message "INFO: Updated IPT_SYSCTL to /etc/sysctl.conf in $UFWDEFAULT"
+    else
+        local error_msg=$(cat /tmp/sed_error)
+        log_message "ERROR: Failed to update IPT_SYSCTL in $UFWDEFAULT - Error: $error_msg"
+        rm -f /tmp/sed_error
+        return 1
+    fi
 
-  for admin in $FW_ADMIN; do
-    ufw allow log from "$admin" to any port "$SSH_PORT" proto tcp
-  done
+    # Configure UFW rules
+    local ufw_rules=(
+        "allow in on lo"              # Allow incoming on loopback
+        "allow out on lo"             # Allow outgoing on loopback
+        "deny in from 127.0.0.0/8"    # Deny loopback spoofing
+        "deny in from ::1"            # Deny IPv6 loopback spoofing
+    )
+    for rule in "${ufw_rules[@]}"; do
+        if ufw $rule 2>/tmp/ufw_error; then
+            log_message "INFO: Applied UFW rule: $rule"
+        else
+            local error_msg=$(cat /tmp/ufw_error)
+            log_message "ERROR: Failed to apply UFW rule '$rule' - Error: $error_msg"
+            rm -f /tmp/ufw_error
+            return 1
+        fi
+    done
 
-  ufw --force enable
+    # Enable UFW logging
+    if ufw logging on 2>/tmp/ufw_error; then
+        log_message "INFO: Enabled UFW logging"
+    else
+        local error_msg=$(cat /tmp/ufw_error)
+        log_message "ERROR: Failed to enable UFW logging - Error: $error_msg"
+        rm -f /tmp/ufw_error
+        return 1
+    fi
 
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status ufw.service --no-pager
-    ufw status verbose
-    echo
-  fi
+    # Set default deny incoming
+    if ufw default deny incoming 2>/tmp/ufw_error; then
+        log_message "INFO: Set UFW default policy to deny incoming"
+    else
+        local error_msg=$(cat /tmp/ufw_error)
+        log_message "ERROR: Failed to set UFW default policy to deny incoming - Error: $error_msg"
+        rm -f /tmp/ufw_error
+        return 1
+    fi
 
-  ((SCRIPT_COUNT++))
+    # Allow SSH from admin IPs
+    local admin_count=0
+    for admin in $FW_ADMIN; do
+        if ufw allow log from "$admin" to any port "$SSH_PORT" proto tcp 2>/tmp/ufw_error; then
+            log_message "INFO: Allowed SSH from $admin to port $SSH_PORT with logging"
+            ((admin_count++))
+        else
+            local error_msg=$(cat /tmp/ufw_error)
+            log_message "ERROR: Failed to allow SSH from $admin to port $SSH_PORT - Error: $error_msg"
+            rm -f /tmp/ufw_error
+            return 1
+        fi
+    done
+    log_message "INFO: Configured $admin_count admin IPs for SSH access"
+
+    # Enable UFW with force
+    if ufw --force enable 2>/tmp/ufw_error; then
+        log_message "INFO: Successfully enabled UFW with force"
+    else
+        local error_msg=$(cat /tmp/ufw_error)
+        log_message "ERROR: Failed to enable UFW - Error: $error_msg"
+        rm -f /tmp/ufw_error
+        return 1
+    fi
+
+    # Verify UFW configuration
+    local verified=true
+    if ufw status | grep -q "Status: active"; then
+        log_message "INFO: Verified UFW is active"
+    else
+        log_message "WARNING: UFW is not active after enabling"
+        verified=false
+    fi
+    if ufw status | grep -q "logging: on"; then
+        log_message "INFO: Verified UFW logging is enabled"
+    else
+        log_message "WARNING: UFW logging is not enabled"
+        verified=false
+    fi
+    for admin in $FW_ADMIN; do
+        if ! ufw status | grep -q "ALLOW.*$admin.*$SSH_PORT"; then
+            log_message "WARNING: SSH rule for $admin on port $SSH_PORT not found in UFW status"
+            verified=false
+        fi
+    done
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified key UFW configuration settings"
+    fi
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status ufw.service --no-pager
+        ufw status verbose
+        echo
+    fi
+    rm -f /tmp/sed_error /tmp/ufw_error /tmp/cp_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
 }
+
+# Example usage (assuming part of larger script)
+# f_firewall

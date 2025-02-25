@@ -1,38 +1,107 @@
-# shellcheck disable=2034
+# shellcheck disable=2034  # Disables warning for unused variables, kept as per original
+
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'  # Modified below based on APTFLAGS
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# CHANGEME=''    # From original, expected to be modified by user
+
+# New variable to add to global variables file:
+# LSB_RELEASE='/usr/bin/lsb_release'  # Path to lsb_release command, added for verification and consistency
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
 
 function f_pre {
-  SCRIPT_COUNT="0"
-  ((SCRIPT_COUNT++))
+    echo "[$SCRIPT_COUNT] Pre-processing setup for hardening script"
 
-  export TERM=linux
-  export DEBIAN_FRONTEND=noninteractive
+    # Initialize SCRIPT_COUNT if not set externally
+    if [[ -z "$SCRIPT_COUNT" ]]; then
+        SCRIPT_COUNT="0"
+        log_message "INFO: Initialized SCRIPT_COUNT to 0"
+    fi
+    ((SCRIPT_COUNT++))
 
-  if [[ $VERBOSE == "Y" ]]; then
-    APTFLAGS='--assume-yes'
-  else
-    APTFLAGS='-qq --assume-yes'
-  fi
+    # Set environment variables for non-interactive operation
+    export TERM=linux
+    export DEBIAN_FRONTEND=noninteractive
+    log_message "INFO: Set TERM=linux and DEBIAN_FRONTEND=noninteractive for non-interactive execution"
 
-  APT="apt-get $APTFLAGS"
+    # Configure APT flags based on verbosity
+    if [[ "$VERBOSE" == "Y" ]]; then
+        APTFLAGS='--assume-yes'
+        log_message "INFO: Set APTFLAGS to '--assume-yes' for verbose mode"
+    else
+        APTFLAGS='-qq --assume-yes'
+        log_message "INFO: Set APTFLAGS to '-qq --assume-yes' for quiet mode"
+    fi
+    APT="apt-get $APTFLAGS"
+    log_message "INFO: Configured APT as '$APT'"
 
-  readonly APTFLAGS
-  readonly APT
+    # Make APTFLAGS and APT readonly
+    readonly APTFLAGS
+    readonly APT
+    log_message "INFO: Set APTFLAGS and APT as readonly variables"
 
-  if [[ $CHANGEME == "" ]]; then
-    echo "Please read the code. Exiting."
-    echo
-    exit 1
-  fi
+    # Check if CHANGEME has been modified
+    if [[ "$CHANGEME" == "" ]]; then
+        log_message "ERROR: CHANGEME variable is still empty. Please read and modify the code."
+        echo "Please read the code. Exiting."
+        echo
+        exit 1
+    else
+        log_message "INFO: CHANGEME variable has been modified to '$CHANGEME', proceeding"
+    fi
 
-  if [ "$EUID" -ne 0 ]; then
-    echo "Not root or not enough privileges. Exiting."
-    echo
-    exit 1
-  fi
+    # Check if running as root
+    if [[ "$EUID" -ne 0 ]]; then
+        log_message "ERROR: Not running as root or insufficient privileges"
+        echo "Not root or not enough privileges. Exiting."
+        echo
+        exit 1
+    else
+        log_message "INFO: Confirmed running as root"
+    fi
 
-  if ! lsb_release -i | grep 'Ubuntu'; then
-    echo "Ubuntu only. Exiting."
-    echo
-    exit 1
-  fi
+    # Ensure running on Ubuntu
+    if ! /usr/bin/lsb_release -i 2>/tmp/lsb_error | grep -q 'Ubuntu'; then
+        local error_msg=$(cat /tmp/lsb_error 2>/dev/null || echo "lsb_release failed")
+        log_message "ERROR: This is not an Ubuntu system - $error_msg"
+        echo "Ubuntu only. Exiting."
+        echo
+        rm -f /tmp/lsb_error
+        exit 1
+    else
+        local ubuntu_version=$(/usr/bin/lsb_release -rs)
+        log_message "INFO: Confirmed running on Ubuntu version $ubuntu_version"
+    fi
+    rm -f /tmp/lsb_error
+
+    # Ensure lsb-release package is installed for verification
+    if ! dpkg -l | grep -q "^ii.*lsb-release"; then
+        log_message "WARNING: lsb-release package not found, required for OS verification"
+        log_message "INFO: Attempting to install lsb-release"
+        if $APT install -y lsb-release 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed lsb-release"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install lsb-release - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            exit 1
+        fi
+    else
+        log_message "INFO: lsb-release package is already installed"
+    fi
+    rm -f /tmp/apt_install_error
 }
+
+# Example usage (assuming part of larger script)
+# f_pre

@@ -1,19 +1,133 @@
-function f_motdnews {
-  if test -f /etc/default/motd-news; then
-    echo "[$SCRIPT_COUNT] Disable motd-news"
-    sed -i 's/ENABLED=.*/ENABLED=0/' /etc/default/motd-news
-    systemctl stop motd-news.timer
-    systemctl mask motd-news.timer
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
 
-    if [[ $VERBOSE == "Y" ]]; then
-      systemctl status motd-news.timer --no-pager
-      echo
-    fi
-
-  if command -v pro 2>/dev/null 1>&2; then
-    pro config set apt_news=false
-  fi
-
-    ((SCRIPT_COUNT++))
-  fi
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_motdnews {
+    # Check if /etc/default/motd-news exists before proceeding
+    if [[ -f "/etc/default/motd-news" ]]; then
+        echo "[$SCRIPT_COUNT] Disabling MOTD news to reduce network activity and exposure"
+
+        # Check if running as root
+        if [[ $EUID -ne 0 ]]; then
+            echo "This function must be run as root" >&2
+            log_message "ERROR: Function must be run as root"
+            return 1
+        fi
+
+        # Ensure systemd is installed (for timer management)
+        if ! dpkg -l | grep -q "^ii.*systemd"; then
+            log_message "WARNING: systemd package not found, required for MOTD news timer management"
+            log_message "INFO: Attempting to install systemd"
+            if $APT install -y systemd 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed systemd"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install systemd - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: systemd package is already installed"
+        fi
+        rm -f /tmp/apt_install_error
+
+        # Backup /etc/default/motd-news
+        local motd_conf="/etc/default/motd-news"
+        mkdir -p "$BACKUP_DIR" || {
+            log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+            return 1
+        }
+        if cp "$motd_conf" "$BACKUP_DIR/motd-news.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $motd_conf to $BACKUP_DIR/motd-news.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $motd_conf - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+
+        # Ensure file is writable
+        if [[ ! -w "$motd_conf" ]]; then
+            log_message "ERROR: $motd_conf is not writable"
+            return 1
+        fi
+
+        # Disable MOTD news in config (CIS 1.8.2)
+        if sed -i 's|^[#]*ENABLED=.*|ENABLED=0|' "$motd_conf" 2>/tmp/sed_error; then
+            log_message "INFO: Set ENABLED=0 in $motd_conf to disable MOTD news"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to disable MOTD news in $motd_conf - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+
+        # Stop and mask motd-news.timer
+        if systemctl stop motd-news.timer 2>/tmp/stop_error; then
+            log_message "INFO: Stopped motd-news.timer"
+        else
+            local error_msg=$(cat /tmp/stop_error)
+            log_message "WARNING: Failed to stop motd-news.timer - Error: $error_msg"  # Non-critical
+        fi
+        if systemctl mask motd-news.timer 2>/tmp/mask_error; then
+            log_message "INFO: Masked motd-news.timer to prevent restarts"
+        else
+            local error_msg=$(cat /tmp/mask_error)
+            log_message "ERROR: Failed to mask motd-news.timer - Error: $error_msg"
+            rm -f /tmp/mask_error
+            return 1
+        fi
+
+        # Disable APT news via pro (Ubuntu Pro client) if available
+        if command -v pro >/dev/null 2>&1; then
+            if pro config set apt_news=false 2>/tmp/pro_error; then
+                log_message "INFO: Disabled APT news via pro config"
+            else
+                local error_msg=$(cat /tmp/pro_error)
+                log_message "ERROR: Failed to disable APT news via pro - Error: $error_msg"
+                rm -f /tmp/pro_error
+                return 1
+            fi
+        else
+            log_message "INFO: pro command not found, skipping APT news disable"
+        fi
+
+        # Verify configuration
+        if grep -q "^ENABLED=0" "$motd_conf" 2>/dev/null; then
+            log_message "INFO: Verified MOTD news disabled in $motd_conf"
+        else
+            log_message "WARNING: ENABLED=0 not set in $motd_conf as expected"
+        fi
+        if systemctl is-enabled motd-news.timer 2>/dev/null | grep -q "masked"; then
+            log_message "INFO: Verified motd-news.timer is masked"
+        else
+            log_message "WARNING: motd-news.timer is not masked as expected"
+        fi
+        if command -v pro >/dev/null 2>&1 && pro config show apt_news 2>/dev/null | grep -q "false"; then
+            log_message "INFO: Verified APT news disabled via pro"
+        fi
+
+        # Show status if verbose
+        if [[ "$VERBOSE" == "Y" ]]; then
+            systemctl status motd-news.timer --no-pager
+            echo
+        fi
+        rm -f /tmp/sed_error /tmp/stop_error /tmp/mask_error /tmp/pro_error /tmp/cp_error /tmp/apt_install_error
+
+        ((SCRIPT_COUNT++))
+    else
+        log_message "INFO: /etc/default/motd-news not found, skipping MOTD news configuration"
+    fi
+}
+
+# Example usage (assuming part of larger script)
+# f_motdnews

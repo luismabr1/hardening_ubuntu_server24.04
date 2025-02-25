@@ -1,12 +1,87 @@
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
 function f_lockroot {
-  echo "[$SCRIPT_COUNT] Lock root account"
+    echo "[$SCRIPT_COUNT] Locking root account to prevent direct login"
 
-  usermod -L root
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
 
-  if [[ $VERBOSE == "Y" ]]; then
-    passwd -S root
-    echo
-  fi
+    # Ensure passwd package is installed (for usermod and passwd commands)
+    if ! dpkg -l | grep -q "^ii.*passwd"; then
+        log_message "WARNING: passwd package not found, required for user management"
+        log_message "INFO: Attempting to install passwd"
+        if $APT install -y passwd 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed passwd"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install passwd - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: passwd package is already installed"
+    fi
+    rm -f /tmp/apt_install_error
 
-  ((SCRIPT_COUNT++))
+    # Backup /etc/shadow (contains root password hash)
+    local shadow_file="/etc/shadow"
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "$shadow_file" ]]; then
+        if cp "$shadow_file" "$BACKUP_DIR/shadow.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $shadow_file to $BACKUP_DIR/shadow.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $shadow_file - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    else
+        log_message "ERROR: $shadow_file not found, cannot proceed with locking root"
+        return 1
+    fi
+
+    # Lock root account (CIS 5.4.2)
+    if usermod -L root 2>/tmp/usermod_error; then
+        log_message "INFO: Successfully locked root account"
+    else
+        local error_msg=$(cat /tmp/usermod_error)
+        log_message "ERROR: Failed to lock root account - Error: $error_msg"
+        rm -f /tmp/usermod_error
+        return 1
+    fi
+
+    # Verify root is locked
+    if passwd -S root 2>/tmp/passwd_error | grep -q "locked"; then
+        log_message "INFO: Verified root account is locked"
+    else
+        local error_msg=$(cat /tmp/passwd_error)
+        log_message "WARNING: Root account does not appear to be locked - Error: $error_msg"
+    fi
+
+    # Show root status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        passwd -S root
+        echo
+    fi
+    rm -f /tmp/cp_error /tmp/usermod_error /tmp/passwd_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
 }

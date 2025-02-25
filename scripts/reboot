@@ -1,5 +1,80 @@
-function f_checkreboot {
-  if [ -f /var/run/reboot-required ]; then
-    cat /var/run/reboot-required
-  fi
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0  # Note: Not incremented here as per original; added optionally below
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+
+# New variable to add to global variables file:
+# REBOOT_REQUIRED='/var/run/reboot-required'  # Path to reboot-required file, added for consistency and reference
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_checkreboot {
+    echo "[$SCRIPT_COUNT] Checking if a system reboot is required"
+
+    # Check if running as root (not strictly required for reading, but consistent with framework)
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function should be run as root for consistency" >&2
+        log_message "WARNING: Function should be run as root for consistency, proceeding with limited privileges"
+    else
+        log_message "INFO: Confirmed running as root"
+    fi
+
+    # Ensure coreutils is installed (for cat)
+    if ! dpkg -l | grep -q "^ii.*coreutils"; then
+        log_message "WARNING: coreutils package not found, required for file operations"
+        log_message "INFO: Attempting to install coreutils"
+        if $APT install -y coreutils 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed coreutils"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install coreutils - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: coreutils package is already installed"
+    fi
+
+    # Check for reboot-required file
+    local reboot_file="/var/run/reboot-required"  # Using REBOOT_REQUIRED if defined in global vars
+    if [[ -f "$reboot_file" ]]; then
+        if [[ -r "$reboot_file" ]]; then
+            local contents
+            contents=$(cat "$reboot_file" 2>/tmp/cat_error)
+            if [[ $? -eq 0 ]]; then
+                log_message "INFO: Reboot required detected. Contents of $reboot_file: $contents"
+                echo "$contents"
+            else
+                local error_msg=$(cat /tmp/cat_error)
+                log_message "ERROR: Failed to read $reboot_file - Error: $error_msg"
+                rm -f /tmp/cat_error
+                return 1
+            fi
+        else
+            log_message "WARNING: $reboot_file exists but is not readable"
+            return 1
+        fi
+    else
+        log_message "INFO: No reboot required; $reboot_file does not exist"
+    fi
+
+    # Optionally increment SCRIPT_COUNT (not in original, added for consistency with other scripts)
+    ((SCRIPT_COUNT++))
+    log_message "INFO: SCRIPT_COUNT incremented to $SCRIPT_COUNT"
+
+    rm -f /tmp/cat_error /tmp/apt_install_error
+}
+
+# Example usage (assuming part of larger script)
+# f_checkreboot

@@ -1,35 +1,186 @@
-function f_suid {
-  echo "[$SCRIPT_COUNT] Remove suid bits"
-  
-  if ! [ -f ./misc/suid.list ]; then
-    echo "The list with SUID binaries can't be found."
-  else
-    while read -r suid; do
-      file=$(command -v "$suid")
-      if [ -x "$file" ]; then
-          if stat -c "%A" "$file" | grep -qi 's'; then
-            if [[ $VERBOSE == "Y" ]]; then
-              echo "$file"
-            fi
-          fi
-          chmod -s "$file"
-          oct=$(stat -c "%A" "$file" | sed 's/s/x/g')
-          ug=$(stat -c "%U %G" "$file")
-          dpkg-statoverride --remove "$file" 2> /dev/null
-          dpkg-statoverride --add "$ug" "$oct" "$file" 2> /dev/null
-      fi
-    done <<< "$(grep -E '^[a-zA-Z0-9]' ./misc/suid.list)"
-  fi
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+# HOSTS_EQUIV='/etc/hosts.equiv'
+# SECURETTY='/etc/securetty'
+# DEBUG_SHELL_SERVICE='debug-shell.service'
+# SSH_MODULI='/etc/ssh/moduli'
+# SSH_SERVICE='ssh.service'
+# SUDOERS_DIR='/etc/sudoers.d'
+# PAM_SU='/etc/pam.d/su'
+# SUDO_LOG='/var/log/sudo.log'
 
-  while read -r suidshells; do
-    if [ -x "$suidshells" ]; then
-      chmod -s "$suidshells"
+# New variables to add to global variables file:
+# SUID_LIST='./misc/suid.list'  # Path to list of binaries to remove SUID bits from
+# SHELLS_FILE='/etc/shells'     # Path to shells file for removing SUID from shell executables
 
-      if [[ $VERBOSE == "Y" ]]; then
-        echo "$suidshells"
-      fi
-    fi
-  done <<< "$(grep -v '^#' /etc/shells)"
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_suid {
+    echo "[$SCRIPT_COUNT] Removing SUID bits from binaries and shells"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure required packages are installed (coreutils for chmod/stat, dpkg for statoverride)
+    local required_pkgs=("coreutils" "dpkg")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg not found, required for SUID management"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+
+    # Backup suid.list and /etc/shells
+    local suid_list="./misc/suid.list"  # Using SUID_LIST if defined
+    local shells_file="/etc/shells"     # Using SHELLS_FILE if defined
+    local files=("$suid_list" "$shells_file")
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        fi
+    done
+
+    # Process suid.list
+    local suid_removed_count=0
+    if [[ ! -f "$suid_list" ]]; then
+        log_message "ERROR: $suid_list not found, cannot remove SUID bits from listed binaries"
+        echo "The list with SUID binaries can't be found."
+    else
+        while read -r suid; do
+            if [[ -n "$suid" ]]; then
+                local file
+                file=$(command -v "$suid" 2>/dev/null)
+                if [[ -x "$file" ]]; then
+                    local has_suid
+                    has_suid=$(stat -c "%A" "$file" 2>/tmp/stat_error | grep -qi 's' && echo "yes" || echo "no")
+                    if [[ $? -eq 0 && "$has_suid" == "yes" ]]; then
+                        if [[ "$VERBOSE" == "Y" ]]; then
+                            echo "$file"
+                        fi
+                        log_message "INFO: Detected SUID bit on $file"
+                    fi
+                    if chmod -s "$file" 2>/tmp/chmod_error; then
+                        log_message "INFO: Removed SUID bit from $file"
+                        local octal_perms
+                        octal_perms=$(stat -c "%a" "$file" 2>/tmp/stat_error | sed 's/^0*//')
+                        if [[ $? -eq 0 ]]; then
+                            local ug
+                            ug=$(stat -c "%U %G" "$file" 2>/tmp/stat_error)
+                            if [[ $? -eq 0 ]]; then
+                                dpkg-statoverride --remove "$file" 2>/dev/null || true  # Remove existing override silently
+                                if dpkg-statoverride --add "$ug" "$octal_perms" "$file" 2>/tmp/statoverride_error; then
+                                    log_message "INFO: Added dpkg-statoverride for $file with permissions $octal_perms and ownership $ug"
+                                    ((suid_removed_count++))
+                                else
+                                    local error_msg=$(cat /tmp/statoverride_error)
+                                    log_message "WARNING: Failed to add dpkg-statoverride for $file - Error: $error_msg"
+                                fi
+                            else
+                                local error_msg=$(cat /tmp/stat_error)
+                                log_message "WARNING: Failed to get ownership for $file - Error: $error_msg"
+                            fi
+                        else
+                            local error_msg=$(cat /tmp/stat_error)
+                            log_message "WARNING: Failed to get permissions for $file - Error: $error_msg"
+                        fi
+                    else
+                        local error_msg=$(cat /tmp/chmod_error)
+                        log_message "ERROR: Failed to remove SUID bit from $file - Error: $error_msg"
+                        rm -f /tmp/chmod_error
+                        return 1
+                    fi
+                else
+                    log_message "INFO: $suid not found or not executable, skipping"
+                fi
+            fi
+        done < <(grep -E '^[a-zA-Z0-9]' "$suid_list" 2>/tmp/grep_error)
+        if [[ $? -ne 0 ]]; then
+            local error_msg=$(cat /tmp/grep_error)
+            log_message "ERROR: Failed to read $suid_list - Error: $error_msg"
+            rm -f /tmp/grep_error
+            return 1
+        fi
+        log_message "INFO: Processed $suid_removed_count binaries from $suid_list"
+    fi
+
+    # Process shells from /etc/shells
+    local shell_removed_count=0
+    if [[ -f "$shells_file" ]]; then
+        while read -r suidshell; do
+            if [[ -n "$suidshell" && -x "$suidshell" ]]; then
+                if chmod -s "$suidshell" 2>/tmp/chmod_error; then
+                    log_message "INFO: Removed SUID bit from shell $suidshell"
+                    if [[ "$VERBOSE" == "Y" ]]; then
+                        echo "$suidshell"
+                    fi
+                    ((shell_removed_count++))
+                else
+                    local error_msg=$(cat /tmp/chmod_error)
+                    log_message "WARNING: Failed to remove SUID bit from $suidshell - Error: $error_msg"
+                fi
+            fi
+        done < <(grep -v '^#' "$shells_file" 2>/tmp/grep_error)
+        if [[ $? -ne 0 ]]; then
+            local error_msg=$(cat /tmp/grep_error)
+            log_message "ERROR: Failed to read $shells_file - Error: $error_msg"
+            rm -f /tmp/grep_error
+            return 1
+        fi
+        log_message "INFO: Processed $shell_removed_count shells from $shells_file"
+    else
+        log_message "WARNING: $shells_file not found, skipping shell SUID removal"
+    fi
+
+    # Verify SUID removal (partial check due to scope)
+    if [[ $suid_removed_count -gt 0 || $shell_removed_count -gt 0 ]]; then
+        log_message "INFO: Verified SUID bits removed from $suid_removed_count binaries and $shell_removed_count shells"
+    else
+        log_message "INFO: No SUID bits were removed; either none found or all attempts failed"
+    fi
+    rm -f /tmp/stat_error /tmp/chmod_error /tmp/statoverride_error /tmp/grep_error /tmp/cp_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_suid

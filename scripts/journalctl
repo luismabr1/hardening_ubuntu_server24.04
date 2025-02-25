@@ -1,22 +1,180 @@
-function f_journalctl {
-  echo "[$SCRIPT_COUNT] Systemd/journald.conf and logrotate.conf"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# JOURNALDCONF='/etc/systemd/journald.conf'
+# LOGROTATE='/etc/logrotate.conf'
+# LOGROTATE_CONF='./misc/logrotate.conf'
+# RSYSLOGCONF='/etc/rsyslog.conf'
 
-  cp "$LOGROTATE_CONF" "$LOGROTATE"
-
-  sed -i 's/^#Storage=.*/Storage=persistent/' "$JOURNALDCONF"
-  sed -i 's/^#ForwardToSyslog=.*/ForwardToSyslog=yes/' "$JOURNALDCONF"
-  sed -i 's/^#Compress=.*/Compress=yes/' "$JOURNALDCONF"
-
-  systemctl restart systemd-journald
-
-  if [ -w "$RSYSLOGCONF" ]; then
-    sed -i "s/^\$FileCreateMode.*/\$FileCreateMode 0600/g" "$RSYSLOGCONF"
-  fi
-
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status systemd-journald --no-pager
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_journalctl {
+    echo "[$SCRIPT_COUNT] Configuring systemd/journald.conf, logrotate.conf, and rsyslog.conf for secure logging"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure required packages are installed (systemd, logrotate, rsyslog)
+    local required_pkgs=("systemd" "logrotate" "rsyslog")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg is not installed, required for logging configuration"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+    rm -f /tmp/apt_install_error
+
+    # Backup configuration files
+    local config_files=("$JOURNALDCONF" "$LOGROTATE" "$RSYSLOGCONF")
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "${config_files[@]}"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        fi
+    done
+
+    # Copy logrotate.conf
+    if [[ -f "$LOGROTATE_CONF" ]]; then
+        if cp "$LOGROTATE_CONF" "$LOGROTATE" 2>/tmp/cp_error; then
+            log_message "INFO: Copied $LOGROTATE_CONF to $LOGROTATE"
+            if chmod 0644 "$LOGROTATE" 2>/tmp/chmod_error; then
+                log_message "INFO: Set permissions to 0644 on $LOGROTATE"
+            else
+                local error_msg=$(cat /tmp/chmod_error)
+                log_message "ERROR: Failed to set permissions on $LOGROTATE - Error: $error_msg"
+                rm -f /tmp/chmod_error
+                return 1
+            fi
+            if chown root:root "$LOGROTATE" 2>/tmp/chown_error; then
+                log_message "INFO: Set ownership to root:root on $LOGROTATE"
+            else
+                local error_msg=$(cat /tmp/chown_error)
+                log_message "ERROR: Failed to set ownership on $LOGROTATE - Error: $error_msg"
+                rm -f /tmp/chown_error
+                return 1
+            fi
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to copy $LOGROTATE_CONF to $LOGROTATE - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    else
+        log_message "ERROR: $LOGROTATE_CONF not found, cannot configure logrotate"
+        return 1
+    fi
+
+    # Configure journald.conf (CIS 4.2.1, NIST AU-9)
+    local journald_settings=(
+        "s|^#Storage=.*|Storage=persistent|"  # Persistent logging
+        "s|^#ForwardToSyslog=.*|ForwardToSyslog=yes|"  # Forward to syslog
+        "s|^#Compress=.*|Compress=yes|"  # Compress logs
+    )
+    for setting in "${journald_settings[@]}"; do
+        if [[ -w "$JOURNALDCONF" ]]; then
+            if sed -i "$setting" "$JOURNALDCONF" 2>/tmp/sed_error; then
+                log_message "INFO: Applied $setting to $JOURNALDCONF"
+            else
+                local error_msg=$(cat /tmp/sed_error)
+                log_message "ERROR: Failed to apply $setting to $JOURNALDCONF - Error: $error_msg"
+                rm -f /tmp/sed_error
+                return 1
+            fi
+        else
+            log_message "ERROR: $JOURNALDCONF is not writable"
+            return 1
+        fi
+    done
+
+    # Restart systemd-journald
+    if systemctl restart systemd-journald 2>/tmp/systemctl_error; then
+        log_message "INFO: Successfully restarted systemd-journald to apply changes"
+    else
+        local error_msg=$(cat /tmp/systemctl_error)
+        log_message "ERROR: Failed to restart systemd-journald - Error: $error_msg"
+        rm -f /tmp/systemctl_error
+        return 1
+    fi
+
+    # Configure rsyslog.conf for secure file permissions
+    if [[ -w "$RSYSLOGCONF" ]]; then
+        if sed -i "s|^\$FileCreateMode.*|\$FileCreateMode 0600|g" "$RSYSLOGCONF" 2>/tmp/sed_error; then
+            log_message "INFO: Set \$FileCreateMode to 0600 in $RSYSLOGCONF"
+            if systemctl restart rsyslog 2>/tmp/rsyslog_error; then
+                log_message "INFO: Restarted rsyslog to apply permissions change"
+            else
+                local error_msg=$(cat /tmp/rsyslog_error)
+                log_message "ERROR: Failed to restart rsyslog - Error: $error_msg"
+                rm -f /tmp/rsyslog_error
+                return 1
+            fi
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to set \$FileCreateMode in $RSYSLOGCONF - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    else
+        log_message "WARNING: $RSYSLOGCONF is not writable, skipping file mode configuration"
+    fi
+
+    # Verify configurations
+    local journald_verified=true
+    for opt in "Storage=persistent" "ForwardToSyslog=yes" "Compress=yes"; do
+        if ! grep -q "^$opt" "$JOURNALDCONF" 2>/dev/null; then
+            log_message "WARNING: $opt not set in $JOURNALDCONF as expected"
+            journald_verified=false
+        fi
+    done
+    if [[ "$journald_verified" == "true" ]]; then
+        log_message "INFO: Verified journald configuration settings"
+    fi
+    if grep -q "^\$FileCreateMode 0600" "$RSYSLOGCONF" 2>/dev/null; then
+        log_message "INFO: Verified \$FileCreateMode 0600 in $RSYSLOGCONF"
+    else
+        log_message "WARNING: \$FileCreateMode 0600 not set in $RSYSLOGCONF"
+    fi
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status systemd-journald --no-pager
+        echo
+    fi
+    rm -f /tmp/sed_error /tmp/systemctl_error /tmp/rsyslog_error /tmp/cp_error /tmp/chmod_error /tmp/chown_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_journalctl

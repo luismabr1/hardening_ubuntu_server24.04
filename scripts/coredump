@@ -1,17 +1,111 @@
-function f_coredump {
-  if test -f "$COREDUMPCONF"; then
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# COREDUMPCONF='/etc/systemd/coredump.conf'
+# APT='apt-get'
 
-    echo "[$SCRIPT_COUNT] Systemd/coredump.conf"
-    sed -i 's/^#Storage=.*/Storage=none/' "$COREDUMPCONF"
-    sed -i 's/^#ProcessSizeMax=.*/ProcessSizeMax=0/' "$COREDUMPCONF"
-
-    systemctl restart systemd-journald
-
-    if [[ $VERBOSE == "Y" ]]; then
-      systemctl status systemd-journald --no-pager
-      echo
-    fi
-
-    ((SCRIPT_COUNT++))
-  fi
+# Function to log messages (assumed defined)
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_coredump {
+    # Check if coredump.conf exists before proceeding
+    if [[ -f "$COREDUMPCONF" ]]; then
+        echo "[$SCRIPT_COUNT] Configuring systemd/coredump.conf to disable core dumps"
+
+        # Check if running as root
+        if [[ $EUID -ne 0 ]]; then
+            echo "This function must be run as root" >&2
+            log_message "ERROR: Function must be run as root"
+            return 1
+        fi
+
+        # Ensure systemd is installed (unlikely to be missing on Ubuntu Server)
+        if ! dpkg -l | grep -q "^ii.*systemd"; then
+            log_message "WARNING: systemd package not found, required for core dump configuration"
+            log_message "INFO: Attempting to install systemd"
+            if $APT install -y systemd 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed systemd"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install systemd - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: systemd package is already installed"
+        fi
+        rm -f /tmp/apt_install_error
+
+        # Backup coredump.conf
+        mkdir -p "$BACKUP_DIR" || {
+            log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+            return 1
+        }
+        if cp "$COREDUMPCONF" "$BACKUP_DIR/coredump.conf.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $COREDUMPCONF to $BACKUP_DIR/coredump.conf.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $COREDUMPCONF - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+
+        # Ensure file is writable
+        if [[ ! -w "$COREDUMPCONF" ]]; then
+            log_message "ERROR: $COREDUMPCONF is not writable"
+            return 1
+        fi
+
+        # Configure coredump settings (CIS 1.6.1, NIST SI-7)
+        local coredump_settings=(
+            "s|^#Storage=.*|Storage=none|"  # Disable core dump storage
+            "s|^#ProcessSizeMax=.*|ProcessSizeMax=0|"  # Set max size to 0
+        )
+        for setting in "${coredump_settings[@]}"; do
+            if sed -i "$setting" "$COREDUMPCONF" 2>/tmp/sed_error; then
+                log_message "INFO: Applied $setting to $COREDUMPCONF"
+            else
+                local error_msg=$(cat /tmp/sed_error)
+                log_message "ERROR: Failed to apply $setting to $COREDUMPCONF - Error: $error_msg"
+                rm -f /tmp/sed_error
+                return 1
+            fi
+        done
+        rm -f /tmp/sed_error
+
+        # Restart systemd-journald to apply changes
+        if systemctl restart systemd-journald 2>/tmp/systemctl_error; then
+            log_message "INFO: Successfully restarted systemd-journald to apply core dump settings"
+        else
+            local error_msg=$(cat /tmp/systemctl_error)
+            log_message "ERROR: Failed to restart systemd-journald - Error: $error_msg"
+            rm -f /tmp/systemctl_error
+            return 1
+        fi
+
+        # Verify core dump settings (optional validation)
+        if grep -q "Storage=none" "$COREDUMPCONF" && grep -q "ProcessSizeMax=0" "$COREDUMPCONF"; then
+            log_message "INFO: Core dump disabling verified in $COREDUMPCONF"
+        else
+            log_message "WARNING: Core dump settings not fully applied in $COREDUMPCONF"
+        fi
+
+        # Show status if verbose
+        if [[ "$VERBOSE" == "Y" ]]; then
+            systemctl status systemd-journald --no-pager
+            echo
+        fi
+
+        ((SCRIPT_COUNT++))
+    else
+        log_message "INFO: $COREDUMPCONF not found, skipping core dump configuration"
+    fi
+}
+
+# Example usage (assuming part of larger script)
+# f_coredump

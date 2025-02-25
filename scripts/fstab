@@ -1,69 +1,241 @@
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
 function f_fstab {
-  echo "[$SCRIPT_COUNT] /etc/fstab and system/tmp.mount"
+    echo "[$SCRIPT_COUNT] Hardening /etc/fstab and configuring system/tmp.mount"
 
-  local TMPFSTAB
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
 
-  cp ./config/tmp.mount /etc/systemd/system/tmp.mount
-  cp /etc/fstab /etc/fstab.bck
+    # Ensure required packages are installed (coreutils for mktemp, systemd)
+    local required_pkgs=("coreutils" "systemd")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg is not installed, required for fstab configuration"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+    rm -f /tmp/apt_install_error
 
-  TMPFSTAB=$(mktemp --tmpdir fstab.XXXXX)
+    # Backup existing files
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "/etc/fstab" ]]; then
+        if cp /etc/fstab "$BACKUP_DIR/fstab.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up /etc/fstab to $BACKUP_DIR/fstab.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup /etc/fstab - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    fi
 
-  sed -i '/floppy/d' /etc/fstab
+    # Copy tmp.mount and ensure it exists
+    local tmp_mount="/etc/systemd/system/tmp.mount"
+    if [[ -f "./config/tmp.mount" ]]; then
+        if cp ./config/tmp.mount "$tmp_mount" 2>/tmp/cp_error; then
+            log_message "INFO: Copied ./config/tmp.mount to $tmp_mount"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to copy ./config/tmp.mount to $tmp_mount - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    else
+        log_message "ERROR: ./config/tmp.mount not found, cannot configure tmp.mount"
+        return 1
+    fi
 
-  grep -v -E '[[:space:]]/boot[[:space:]]|[[:space:]]/home[[:space:]]|[[:space:]]/var/log[[:space:]]|[[:space:]]/var/log/audit[[:space:]]|[[:space:]]/var/tmp[[:space:]]' /etc/fstab > "$TMPFSTAB"
+    # Create temporary fstab file
+    local TMPFSTAB
+    TMPFSTAB=$(mktemp --tmpdir fstab.XXXXX 2>/tmp/mktemp_error)
+    if [[ $? -eq 0 ]]; then
+        log_message "INFO: Created temporary fstab file at $TMPFSTAB"
+    else
+        local error_msg=$(cat /tmp/mktemp_error)
+        log_message "ERROR: Failed to create temporary fstab file - Error: $error_msg"
+        rm -f /tmp/mktemp_error
+        return 1
+    fi
 
-  if grep -q '[[:space:]]/boot[[:space:]].*' /etc/fstab; then
-    grep '[[:space:]]/boot[[:space:]].*' /etc/fstab | sed 's/defaults/defaults,nosuid,nodev/g' >> "$TMPFSTAB"
-  fi
+    # Harden /etc/fstab based on provided disk config
+    if sed -i '/floppy/d' /etc/fstab 2>/tmp/sed_error; then
+        log_message "INFO: Removed floppy entries from /etc/fstab"
+    else
+        local error_msg=$(cat /tmp/sed_error)
+        log_message "ERROR: Failed to remove floppy entries from /etc/fstab - Error: $error_msg"
+        rm -f /tmp/sed_error
+        return 1
+    fi
 
-  if grep -q '[[:space:]]/home[[:space:]].*' /etc/fstab; then
-    grep '[[:space:]]/home[[:space:]].*' /etc/fstab | sed 's/defaults/defaults,nosuid,nodev/g' >> "$TMPFSTAB"
-  fi
+    # Filter out specific mounts and copy others
+    if grep -v -E '[[:space:]]/boot[[:space:]]|[[:space:]]/home[[:space:]]|[[:space:]]/var/log[[:space:]]|[[:space:]]/var/log/audit[[:space:]]|[[:space:]]/var/tmp[[:space:]]' /etc/fstab > "$TMPFSTAB" 2>/tmp/grep_error; then
+        log_message "INFO: Filtered out specific mounts from /etc/fstab to $TMPFSTAB"
+    else
+        local error_msg=$(cat /tmp/grep_error)
+        log_message "ERROR: Failed to filter /etc/fstab - Error: $error_msg"
+        rm -f /tmp/grep_error "$TMPFSTAB"
+        return 1
+    fi
 
-  if grep -q '[[:space:]]/var/log[[:space:]].*' /etc/fstab; then
-    grep '[[:space:]]/var/log[[:space:]].*' /etc/fstab | sed 's/defaults/defaults,nosuid,nodev,noexec/g' >> "$TMPFSTAB"
-  fi
-
-  if grep -q '[[:space:]]/var/log/audit[[:space:]].*' /etc/fstab; then
-    grep '[[:space:]]/var/log/audit[[:space:]].*' /etc/fstab | sed 's/defaults/defaults,nosuid,nodev,noexec/g' >> "$TMPFSTAB"
-  fi
-
-  if grep -q '[[:space:]]/var/tmp[[:space:]].*' /etc/fstab; then
-    grep '[[:space:]]/var/tmp[[:space:]].*' /etc/fstab | sed 's/defaults/defaults,nosuid,nodev,noexec/g' >> "$TMPFSTAB"
-  fi
-
-  cp "$TMPFSTAB" /etc/fstab
-
-  if ! grep -q '/run/shm ' /etc/fstab; then
-    echo 'none /run/shm tmpfs rw,noexec,nosuid,nodev 0 0' >> /etc/fstab
-  fi
-
-  if ! grep -q '/dev/shm ' /etc/fstab; then
-    echo 'none /dev/shm tmpfs rw,noexec,nosuid,nodev 0 0' >> /etc/fstab
-  fi
-
-  if ! grep -q '/proc ' /etc/fstab; then
-    echo 'none /proc proc rw,nosuid,nodev,noexec,relatime,hidepid=2 0 0' >> /etc/fstab
-  fi
-
-  if [ -e /etc/systemd/system/tmp.mount ]; then
-    sed -i '/^\/tmp/d' /etc/fstab
-
-    for t in $(mount | grep "[[:space:]]/tmp[[:space:]]" | awk '{print $3}'); do
-      umount "$t"
+    # Add hardened mount options matching your config
+    local mounts=(
+        "/boot rw"  # Per your config: only rw
+        "/home nosuid,nodev"
+        "/var/log nosuid,nodev,noexec"
+        "/var/log/audit nosuid,nodev,noexec"
+        "/var/tmp nosuid,nodev,noexec"
+    )
+    for mount in "${mounts[@]}"; do
+        local path=$(echo "$mount" | cut -d' ' -f1)
+        local options=$(echo "$mount" | cut -d' ' -f2)
+        if grep -q "[[:space:]]$path[[:space:]].*" /etc/fstab; then
+            if grep "[[:space:]]$path[[:space:]].*" /etc/fstab | sed "s/defaults/defaults,$options/" >> "$TMPFSTAB" 2>/tmp/sed_error; then
+                log_message "INFO: Added $options to $path in $TMPFSTAB"
+            else
+                local error_msg=$(cat /tmp/sed_error)
+                log_message "ERROR: Failed to add $options to $path in $TMPFSTAB - Error: $error_msg"
+                rm -f /tmp/sed_error "$TMPFSTAB"
+                return 1
+            fi
+        else
+            log_message "INFO: $path not found in original /etc/fstab, skipping"
+        fi
     done
 
-    sed -i '/[[:space:]]\/tmp[[:space:]]/d' /etc/fstab
+    # Replace /etc/fstab
+    if cp "$TMPFSTAB" /etc/fstab 2>/tmp/cp_error; then
+        log_message "INFO: Updated /etc/fstab with hardened settings"
+        rm -f "$TMPFSTAB"
+    else
+        local error_msg=$(cat /tmp/cp_error)
+        log_message "ERROR: Failed to update /etc/fstab from $TMPFSTAB - Error: $error_msg"
+        rm -f /tmp/cp_error "$TMPFSTAB"
+        return 1
+    fi
 
-    ln -s /etc/systemd/system/tmp.mount /etc/systemd/system/default.target.wants/tmp.mount
-    sed -i 's/Options=.*/Options=mode=1777,strictatime,noexec,nodev,nosuid/' /etc/systemd/system/tmp.mount
+    # Add additional secure mounts if not present
+    local additional_mounts=(
+        "/run/shm tmpfs rw,noexec,nosuid,nodev 0 0"
+        "/dev/shm tmpfs rw,noexec,nosuid,nodev 0 0"
+        "/proc proc rw,nosuid,nodev,noexec,relatime,hidepid=2 0 0"
+    )
+    for mount in "${additional_mounts[@]}"; do
+        local mountpoint=$(echo "$mount" | cut -d' ' -f2)
+        if ! grep -q "$mountpoint " /etc/fstab; then
+            if echo "$mount" >> /etc/fstab 2>/tmp/echo_error; then
+                log_message "INFO: Added secure mount for $mountpoint to /etc/fstab"
+            else
+                local error_msg=$(cat /tmp/echo_error)
+                log_message "ERROR: Failed to add $mountpoint to /etc/fstab - Error: $error_msg"
+                rm -f /tmp/echo_error
+                return 1
+            fi
+        else
+            log_message "INFO: $mountpoint already configured in /etc/fstab"
+        fi
+    done
 
-    chmod 0644 /etc/systemd/system/tmp.mount
+    # Configure tmp.mount if available
+    if [[ -e "$tmp_mount" ]]; then
+        if sed -i '/^\/tmp/d' /etc/fstab 2>/tmp/sed_error; then
+            log_message "INFO: Removed /tmp entries from /etc/fstab"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to remove /tmp from /etc/fstab - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
 
-    systemctl daemon-reload
-  else
-    echo '/etc/systemd/system/tmp.mount was not found.'
-  fi
+        # Unmount existing /tmp mounts
+        local unmounted=0
+        while IFS= read -r t; do
+            if umount "$t" 2>/tmp/umount_error; then
+                log_message "INFO: Unmounted $t"
+                ((unmounted++))
+            else
+                local error_msg=$(cat /tmp/umount_error)
+                log_message "WARNING: Failed to unmount $t - Error: $error_msg"
+            fi
+        done < <(mount | grep "[[:space:]]/tmp[[:space:]]" | awk '{print $3}')
+        log_message "INFO: Unmounted $unmounted /tmp instances"
 
-  ((SCRIPT_COUNT++))
+        # Link tmp.mount to default.target.wants
+        local wants_dir="/etc/systemd/system/default.target.wants"
+        mkdir -p "$wants_dir" || {
+            log_message "ERROR: Failed to create $wants_dir"
+            return 1
+        }
+        if ln -sf "$tmp_mount" "$wants_dir/tmp.mount" 2>/tmp/ln_error; then
+            log_message "INFO: Linked $tmp_mount to $wants_dir/tmp.mount"
+        else
+            local error_msg=$(cat /tmp/ln_error)
+            log_message "ERROR: Failed to link $tmp_mount - Error: $error_msg"
+            rm -f /tmp/ln_error
+            return 1
+        fi
+
+        # Harden tmp.mount options
+        if sed -i 's|Options=.*|Options=mode=1777,strictatime,noexec,nodev,nosuid|' "$tmp_mount" 2>/tmp/sed_error; then
+            log_message "INFO: Hardened tmp.mount options in $tmp_mount"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to harden tmp.mount options - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+
+        if chmod 0644 "$tmp_mount" 2>/tmp/chmod_error; then
+            log_message "INFO: Set permissions (0644) on $tmp_mount"
+        else
+            local error_msg=$(cat /tmp/chmod_error)
+            log_message "ERROR: Failed to set permissions on $tmp_mount - Error: $error_msg"
+            rm -f /tmp/chmod_error
+            return 1
+        fi
+
+        if systemctl daemon-reload 2>/tmp/daemon_error; then
+            log_message "INFO: Reloaded systemd daemon for tmp.mount changes"
+        else
+            local error_msg=$(cat /tmp/daemon_error)
+            log_message "ERROR: Failed to reload systemd daemon - Error: $error_msg"
+            rm -f /tmp/daemon_error
+            return 1
+        fi
+    else
+        log_message "WARNING: $tmp_mount not found after copy, skipping tmp.mount configuration"
+    fi
+    rm -f /tmp/sed_error /tmp/grep_error /tmp/echo_error /tmp/cp_error /tmp/ln_error /tmp/chmod_error /tmp/daemon_error /tmp/umount_error /tmp/mktemp_error
+
+    ((SCRIPT_COUNT++))
 }
+
+# Example usage (assuming part of larger script)
+# f_fstab

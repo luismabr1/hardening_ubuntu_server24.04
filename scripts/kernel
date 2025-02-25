@@ -1,21 +1,141 @@
-function f_kernel {
-  echo "[$SCRIPT_COUNT] Kernel parameters"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# DEFAULTGRUB='/etc/default/grub.d'
 
-  local HASHSIZE
-  local LOCKDOWN
-
-  HASHSIZE="/sys/module/nf_conntrack/parameters/hashsize"
-  LOCKDOWN="/sys/kernel/security/lockdown"
-
-  if [[ -f "$HASHSIZE" && -w "$HASHSIZE" ]]; then
-    echo 1048576 > /sys/module/nf_conntrack/parameters/hashsize
-  fi
-
-  if [[ -f "$LOCKDOWN" && -w "$LOCKDOWN" ]]; then
-    if ! grep -q 'lockdown=' /proc/cmdline; then
-      echo "GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX lockdown=confidentiality\"" > "$DEFAULTGRUB/99-hardening-lockdown.cfg"
-    fi
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_kernel {
+    echo "[$SCRIPT_COUNT] Configuring kernel parameters for security and performance"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure required packages are installed (grub2-common for GRUB updates)
+    local required_pkgs=("grub2-common")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg is not installed, required for GRUB configuration"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+    rm -f /tmp/apt_install_error
+
+    # Define kernel parameter files
+    local HASHSIZE="/sys/module/nf_conntrack/parameters/hashsize"
+    local LOCKDOWN="/sys/kernel/security/lockdown"
+    local grub_file="$DEFAULTGRUB/99-hardening-lockdown.cfg"
+
+    # Backup GRUB config if it exists
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "$grub_file" ]]; then
+        if cp "$grub_file" "$BACKUP_DIR/$(basename "$grub_file").$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $grub_file to $BACKUP_DIR/$(basename "$grub_file").$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $grub_file - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    fi
+
+    # Configure nf_conntrack hashsize (CIS 3.1.1)
+    if [[ -f "$HASHSIZE" ]]; then
+        if [[ -w "$HASHSIZE" ]]; then
+            if echo 1048576 > "$HASHSIZE" 2>/tmp/echo_error; then
+                log_message "INFO: Set nf_conntrack hashsize to 1048576"
+            else
+                local error_msg=$(cat /tmp/echo_error)
+                log_message "ERROR: Failed to set nf_conntrack hashsize - Error: $error_msg"
+                rm -f /tmp/echo_error
+                return 1
+            fi
+        else
+            log_message "WARNING: $HASHSIZE is not writable, skipping hashsize configuration"
+        fi
+        # Verify hashsize
+        if [[ "$(cat "$HASHSIZE" 2>/dev/null)" -eq 1048576 ]]; then
+            log_message "INFO: Verified nf_conntrack hashsize is set to 1048576"
+        else
+            log_message "WARNING: nf_conntrack hashsize not set to 1048576 as expected"
+        fi
+    else
+        log_message "INFO: $HASHSIZE not found, skipping nf_conntrack hashsize configuration"
+    fi
+
+    # Configure kernel lockdown (NIST CM-7)
+    if [[ -f "$LOCKDOWN" ]]; then
+        if [[ -w "$LOCKDOWN" ]]; then
+            if ! grep -q 'lockdown=' /proc/cmdline; then
+                mkdir -p "$DEFAULTGRUB" || {
+                    log_message "ERROR: Failed to create $DEFAULTGRUB directory"
+                    return 1
+                }
+                if echo "GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX lockdown=confidentiality\"" > "$grub_file" 2>/tmp/echo_error; then
+                    chmod 0644 "$grub_file" 2>/tmp/chmod_error || {
+                        local error_msg=$(cat /tmp/chmod_error)
+                        log_message "ERROR: Failed to set permissions on $grub_file - Error: $error_msg"
+                        rm -f /tmp/chmod_error
+                        return 1
+                    }
+                    log_message "INFO: Configured lockdown=confidentiality in $grub_file"
+                    if update-grub 2>/tmp/grub_error; then
+                        log_message "INFO: Updated GRUB configuration (reboot required)"
+                    else
+                        local error_msg=$(cat /tmp/grub_error)
+                        log_message "ERROR: Failed to update GRUB - Error: $error_msg"
+                        rm -f /tmp/grub_error
+                        return 1
+                    fi
+                else
+                    local error_msg=$(cat /tmp/echo_error)
+                    log_message "ERROR: Failed to configure lockdown in $grub_file - Error: $error_msg"
+                    rm -f /tmp/echo_error
+                    return 1
+                fi
+            else
+                log_message "INFO: Lockdown parameter already present in /proc/cmdline, skipping"
+            fi
+        else
+            log_message "WARNING: $LOCKDOWN is not writable, skipping lockdown runtime configuration"
+        fi
+        # Verify lockdown in GRUB config (won't verify runtime until reboot)
+        if grep -q "lockdown=confidentiality" "$grub_file" 2>/dev/null; then
+            log_message "INFO: Verified lockdown=confidentiality added to $grub_file"
+        else
+            log_message "WARNING: lockdown=confidentiality not found in $grub_file after configuration"
+        fi
+    else
+        log_message "INFO: $LOCKDOWN not found, skipping lockdown configuration"
+    fi
+    rm -f /tmp/echo_error /tmp/cp_error /tmp/grub_error /tmp/chmod_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_kernel

@@ -1,30 +1,125 @@
-function f_apport {
-  echo "[$SCRIPT_COUNT] Disable apport, ubuntu-report and popularity-contest"
+# Assuming this is part of your larger script with variables like these:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'  # Assuming APT is defined as your package manager command
 
-  if command -v gsettings 2>/dev/null 1>&2; then
-    gsettings set com.ubuntu.update-notifier show-apport-crashes false
-  fi
-
-  if command -v ubuntu-report 2>/dev/null 1>&2; then
-    ubuntu-report -f send no
-  fi
-
-  if [ -f /etc/default/apport ]; then
-    sed -i 's/enabled=.*/enabled=0/' /etc/default/apport
-    systemctl stop apport.service
-    systemctl mask apport.service
-  fi
-
-  if dpkg -l | grep -E '^ii.*popularity-contest' 2>/dev/null 1>&2; then
-    $APT purge popularity-contest
-  fi
-
-  systemctl daemon-reload
-
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status apport.service --no-pager
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages (assuming it's already defined)
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_apport {
+    echo "[$SCRIPT_COUNT] Disable apport, ubuntu-report and popularity-contest"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        return 1
+    fi
+
+    # Disable apport crash notifications via gsettings
+    if command -v gsettings >/dev/null 2>&1; then
+        if gsettings set com.ubuntu.update-notifier show-apport-crashes false 2>/tmp/gsettings_error; then
+            log_message "INFO: Disabled apport crash notifications via gsettings"
+        else
+            local error_msg=$(cat /tmp/gsettings_error)
+            log_message "ERROR: Failed to disable apport crash notifications via gsettings - Error: $error_msg"
+        fi
+    else
+        log_message "INFO: gsettings not available, skipping apport crash notification setting"
+    fi
+    rm -f /tmp/gsettings_error
+
+    # Disable ubuntu-report data sending
+    if command -v ubuntu-report >/dev/null 2>&1; then
+        if ubuntu-report -f send no 2>/tmp/ubuntu_report_error; then
+            log_message "INFO: Disabled ubuntu-report data sending"
+        else
+            local error_msg=$(cat /tmp/ubuntu_report_error)
+            log_message "ERROR: Failed to disable ubuntu-report - Error: $error_msg"
+        fi
+    else
+        log_message "INFO: ubuntu-report not installed, skipping"
+    fi
+    rm -f /tmp/ubuntu_report_error
+
+    # Modify and disable apport service
+    local apport_file="/etc/default/apport"
+    if [[ -f "$apport_file" ]]; then
+        # Backup before modifying
+        mkdir -p "$BACKUP_DIR" || {
+            log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+            return 1
+        }
+        cp "$apport_file" "$BACKUP_DIR/apport.$TIMESTAMP" && \
+            log_message "INFO: Backed up $apport_file to $BACKUP_DIR/apport.$TIMESTAMP" || {
+            log_message "ERROR: Failed to backup $apport_file"
+            return 1
+        }
+
+        # Modify configuration
+        if sed -i 's/enabled=.*/enabled=0/' "$apport_file" 2>/tmp/sed_error; then
+            log_message "INFO: Set apport enabled=0 in $apport_file"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to modify $apport_file - Error: $error_msg"
+            return 1
+        fi
+
+        # Stop and mask service
+        if systemctl stop apport.service 2>/tmp/systemctl_stop_error; then
+            log_message "INFO: Stopped apport.service"
+        else
+            local error_msg=$(cat /tmp/systemctl_stop_error)
+            log_message "WARNING: Failed to stop apport.service - Error: $error_msg"
+        fi
+
+        if systemctl mask apport.service 2>/tmp/systemctl_mask_error; then
+            log_message "INFO: Masked apport.service"
+        else
+            local error_msg=$(cat /tmp/systemctl_mask_error)
+            log_message "ERROR: Failed to mask apport.service - Error: $error_msg"
+            return 1
+        fi
+    else
+        log_message "INFO: $apport_file not found, skipping apport configuration"
+    fi
+    rm -f /tmp/sed_error /tmp/systemctl_stop_error /tmp/systemctl_mask_error
+
+    # Remove popularity-contest if installed
+    if dpkg -l | grep -E '^ii.*popularity-contest' >/dev/null 2>&1; then
+        if $APT purge -y popularity-contest 2>/tmp/apt_error; then
+            log_message "INFO: Successfully purged popularity-contest"
+        else
+            local error_msg=$(cat /tmp/apt_error)
+            log_message "ERROR: Failed to purge popularity-contest - Error: $error_msg"
+            return 1
+        fi
+    else
+        log_message "INFO: popularity-contest not installed, skipping purge"
+    fi
+    rm -f /tmp/apt_error
+
+    # Reload systemd daemon
+    if systemctl daemon-reload 2>/tmp/daemon_reload_error; then
+        log_message "INFO: Successfully reloaded systemd daemon"
+    else
+        local error_msg=$(cat /tmp/daemon_reload_error)
+        log_message "ERROR: Failed to reload systemd daemon - Error: $error_msg"
+        return 1
+    fi
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status apport.service --no-pager
+        echo
+    fi
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_apport

@@ -1,36 +1,228 @@
-function f_auditd {
-  if [[ $LXC == "1" ]]; then
-    return
-  fi
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# LXC='0'
+# AUDITDCONF='/etc/audit/auditd.conf'
+# AUDITRULES='/etc/audit/rules.d/hardening.rules'
+# DEFAULTGRUB='/etc/default/grub.d'
+# AUDITD_MODE='1'
+# AUDITD_RULES='./misc/audit-base.rules ./misc/audit-aggressive.rules ./misc/audit-docker.rules'
 
-  echo "[$SCRIPT_COUNT] Auditd"
-
-  sed -i 's/^action_mail_acct =.*/action_mail_acct = root/' "$AUDITDCONF"
-  sed -i 's/^admin_space_left_action = .*/admin_space_left_action = halt/' "$AUDITDCONF"
-  sed -i 's/^max_log_file_action =.*/max_log_file_action = keep_logs/' "$AUDITDCONF"
-  sed -i 's/^space_left_action =.*/space_left_action = email/' "$AUDITDCONF"
-
-  if ! grep -q 'audit=1' /proc/cmdline; then
-    echo "GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX audit=1 audit_backlog_limit=8192\"" > "$DEFAULTGRUB/99-hardening-audit.cfg"
-  fi
-
-  cp "./misc/audit.header" /etc/audit/audit.rules
-  for l in $AUDITD_RULES; do
-    cat "$l" >> /etc/audit/audit.rules
-  done
-  cat "./misc/audit.footer" >> /etc/audit/audit.rules
-
-  sed -i "s/-f.*/-f $AUDITD_MODE/g" /etc/audit/audit.rules
-
-  cp /etc/audit/audit.rules "$AUDITRULES"
-
-  systemctl enable auditd
-  systemctl restart auditd.service
-
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status auditd.service --no-pager
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages (assumed defined)
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_auditd {
+    # Skip if running in LXC environment (auditd not supported in containers)
+    if [[ "$LXC" == "1" ]]; then
+        log_message "INFO: Skipping auditd configuration in LXC environment"
+        return 0
+    fi
+
+    echo "[$SCRIPT_COUNT] Configuring auditd"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        return 1
+    fi
+
+    # Ensure auditd is installed
+    if ! command -v auditctl >/dev/null 2>&1; then
+        log_message "ERROR: auditd not installed. Please install with 'apt install auditd'"
+        return 1
+    fi
+
+    # Backup configuration files
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "$AUDITDCONF" "$AUDITRULES"; do
+        if [[ -f "$file" ]]; then
+            cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" && \
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP" || {
+                log_message "ERROR: Failed to backup $file"
+                return 1
+            }
+        fi
+    done
+
+    # Ensure configuration files are writable
+    for file in "$AUDITDCONF" "$AUDITRULES"; do
+        if [[ ! -f "$file" ]]; then
+            touch "$file" || {
+                log_message "ERROR: Failed to create $file"
+                return 1
+            }
+        fi
+        if [[ ! -w "$file" ]]; then
+            log_message "ERROR: $file is not writable"
+            return 1
+        fi
+    done
+
+    # Configure auditd.conf with secure settings (CIS Benchmark AU-5, NIST 800-53 AU-9)
+    local auditd_settings=(
+        "s|^action_mail_acct =.*|action_mail_acct = root|"  # Send alerts to root
+        "s|^admin_space_left_action =.*|admin_space_left_action = halt|"  # Halt on critical space issues
+        "s|^max_log_file_action =.*|max_log_file_action = keep_logs|"  # Preserve logs
+        "s|^space_left_action =.*|space_left_action = email|"  # Email on low space
+    )
+    for setting in "${auditd_settings[@]}"; do
+        if sed -i "$setting" "$AUDITDCONF" 2>/tmp/sed_error; then
+            log_message "INFO: Applied $setting to $AUDITDCONF"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to apply $setting to $AUDITDCONF - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    done
+    rm -f /tmp/sed_error
+
+    # Enable audit in GRUB (CIS 1.5.1, NIST AU-2)
+    local grub_file="$DEFAULTGRUB/99-hardening-audit.cfg"
+    if ! grep -q 'audit=1' /proc/cmdline; then
+        mkdir -p "$DEFAULTGRUB" || {
+            log_message "ERROR: Failed to create $DEFAULTGRUB"
+            return 1
+        }
+        [[ -f "$grub_file" ]] && cp "$grub_file" "$BACKUP_DIR/99-hardening-audit.cfg.$TIMESTAMP" && \
+            log_message "INFO: Backed up $grub_file to $BACKUP_DIR/99-hardening-audit.cfg.$TIMESTAMP"
+        
+        if echo "GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX audit=1 audit_backlog_limit=8192\"" > "$grub_file" 2>/tmp/grub_error; then
+            chmod 0644 "$grub_file"
+            log_message "INFO: Configured GRUB with audit=1 and backlog limit in $grub_file"
+            if update-grub 2>/tmp/update_grub_error; then
+                log_message "INFO: Successfully updated GRUB configuration (reboot required)"
+            else
+                local error_msg=$(cat /tmp/update_grub_error)
+                log_message "ERROR: Failed to update GRUB - Error: $error_msg"
+                rm -f /tmp/update_grub_error
+                return 1
+            fi
+        else
+            local error_msg=$(cat /tmp/grub_error)
+            log_message "ERROR: Failed to write to $grub_file - Error: $error_msg"
+            rm -f /tmp/grub_error
+            return 1
+        fi
+    else
+        log_message "INFO: Audit already enabled in kernel parameters"
+    fi
+    rm -f /tmp/grub_error /tmp/update_grub_error
+
+    # Configure audit rules (CIS 4.1, NIST AU-3)
+    local rules_dest="/etc/audit/audit.rules"
+    mkdir -p "$(dirname "$AUDITRULES")" || {
+        log_message "ERROR: Failed to create directory $(dirname "$AUDITRULES")"
+        return 1
+    }
+
+    # Verify and assemble rules
+    if [[ ! -f "./misc/audit.header" ]]; then
+        log_message "ERROR: audit.header not found in ./misc/"
+        return 1
+    fi
+    if cp "./misc/audit.header" "$rules_dest" 2>/tmp/cp_error; then
+        log_message "INFO: Copied audit.header to $rules_dest"
+    else
+        local error_msg=$(cat /tmp/cp_error)
+        log_message "ERROR: Failed to copy audit.header to $rules_dest - Error: $error_msg"
+        rm -f /tmp/cp_error
+        return 1
+    fi
+
+    for rule_file in $AUDITD_RULES; do
+        if [[ ! -f "$rule_file" ]]; then
+            log_message "ERROR: Rule file $rule_file not found"
+            return 1
+        fi
+        if cat "$rule_file" >> "$rules_dest" 2>/tmp/cat_error; then
+            log_message "INFO: Appended $rule_file to $rules_dest"
+        else
+            local error_msg=$(cat /tmp/cat_error)
+            log_message "ERROR: Failed to append $rule_file to $rules_dest - Error: $error_msg"
+            rm -f /tmp/cat_error
+            return 1
+        fi
+    done
+
+    if [[ ! -f "./misc/audit.footer" ]]; then
+        log_message "ERROR: audit.footer not found in ./misc/"
+        return 1
+    fi
+    if cat "./misc/audit.footer" >> "$rules_dest" 2>/tmp/cat_error; then
+        log_message "INFO: Appended audit.footer to $rules_dest"
+    else
+        local error_msg=$(cat /tmp/cat_error)
+        log_message "ERROR: Failed to append audit.footer to $rules_dest - Error: $error_msg"
+        rm -f /tmp/cat_error
+        return 1
+    fi
+
+    # Set failure mode
+    if sed -i "s|-f.*|-f $AUDITD_MODE|g" "$rules_dest" 2>/tmp/sed_error; then
+        log_message "INFO: Set audit failure mode to $AUDITD_MODE in $rules_dest"
+    else
+        local error_msg=$(cat /tmp/sed_error)
+        log_message "ERROR: Failed to set audit failure mode in $rules_dest - Error: $error_msg"
+        rm -f /tmp/sed_error
+        return 1
+    fi
+
+    # Sync rules to hardening.rules
+    if cp "$rules_dest" "$AUDITRULES" 2>/tmp/cp_error; then
+        chmod 0640 "$AUDITRULES"  # Restrict permissions (CIS 4.1.1.3)
+        log_message "INFO: Synced $rules_dest to $AUDITRULES with secure permissions"
+    else
+        local error_msg=$(cat /tmp/cp_error)
+        log_message "ERROR: Failed to sync $rules_dest to $AUDITRULES - Error: $error_msg"
+        rm -f /tmp/cp_error
+        return 1
+    fi
+    rm -f /tmp/cp_error /tmp/cat_error /tmp/sed_error
+
+    # Enable and restart auditd
+    if systemctl enable auditd 2>/tmp/systemctl_error; then
+        log_message "INFO: Enabled auditd service"
+    else
+        local error_msg=$(cat /tmp/systemctl_error)
+        log_message "ERROR: Failed to enable auditd - Error: $error_msg"
+        rm -f /tmp/systemctl_error
+        return 1
+    fi
+    if systemctl restart auditd.service 2>/tmp/systemctl_error; then
+        log_message "INFO: Restarted auditd service"
+    else
+        local error_msg=$(cat /tmp/systemctl_error)
+        log_message "ERROR: Failed to restart auditd - Error: $error_msg"
+        rm -f /tmp/systemctl_error
+        return 1
+    fi
+    rm -f /tmp/systemctl_error
+
+    # Verify auditd is running and logging
+    if auditctl -s | grep -q "enabled 1"; then
+        log_message "INFO: auditd is enabled and running"
+    else
+        log_message "ERROR: auditd is not enabled after restart"
+        return 1
+    fi
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status auditd.service --no-pager
+        echo
+    fi
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_auditd
