@@ -1,10 +1,14 @@
-# Global variables (assumed part of larger script)
-SCRIPT_COUNT=0
-LOG_FILE="/var/log/user_hardening.log"
-BACKUP_DIR="/root/backups"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-VERBOSE='N'
-APT='apt-get'
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+
+# New variables to add to global variables file (if not already present):
+# AIDE_CONF='/etc/aide/aide.conf'  # Path to AIDE configuration file
 
 # Function to log messages
 log_message() {
@@ -12,7 +16,7 @@ log_message() {
 }
 
 function f_aide {
-    echo "[$SCRIPT_COUNT] Configuring AIDE for file integrity monitoring"
+    echo "[$SCRIPT_COUNT] Configuring AIDE for intrusion detection"
 
     # Check if running as root
     if [[ $EUID -ne 0 ]]; then
@@ -21,28 +25,35 @@ function f_aide {
         return 1
     fi
 
-    # Ensure AIDE is installed
+    # Ensure aide is installed
     if ! dpkg -l | grep -q "^ii.*aide"; then
-        log_message "WARNING: aide package not installed, required for file integrity monitoring"
+        log_message "WARNING: aide package not found, required for AIDE configuration"
         log_message "INFO: Attempting to install aide"
         if $APT install -y aide 2>/tmp/apt_install_error; then
             log_message "INFO: Successfully installed aide"
         else
             local error_msg=$(cat /tmp/apt_install_error)
             log_message "ERROR: Failed to install aide - Error: $error_msg"
+            echo "Failed to install aide. Check $LOG_FILE for details."
             rm -f /tmp/apt_install_error
             return 1
         fi
     else
         log_message "INFO: aide package is already installed"
     fi
-    rm -f /tmp/apt_install_error
+
+    # Verify aideinit is available
+    if ! command -v aideinit >/dev/null 2>&1; then
+        log_message "ERROR: aideinit not found, ensure aide is installed correctly"
+        echo "aideinit not found, ensure aide is installed. Exiting."
+        return 1
+    fi
 
     # Backup AIDE configuration
-    local aide_conf="/etc/aide/aide.conf"
-    local aide_conf_dir="/etc/aide/aide.conf.d"
+    local aide_conf="/etc/aide/aide.conf"  # Using AIDE_CONF if defined
     mkdir -p "$BACKUP_DIR" || {
         log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        echo "Failed to create backup directory $BACKUP_DIR. Exiting."
         return 1
     }
     if [[ -f "$aide_conf" ]]; then
@@ -51,207 +62,108 @@ function f_aide {
         else
             local error_msg=$(cat /tmp/cp_error)
             log_message "ERROR: Failed to backup $aide_conf - Error: $error_msg"
+            echo "Failed to backup $aide_conf. Check $LOG_FILE for details."
             rm -f /tmp/cp_error
+            return 1
+        fi
+    else
+        log_message "WARNING: $aide_conf not found, creating default configuration"
+        if touch "$aide_conf" 2>/tmp/touch_error; then
+            log_message "INFO: Created $aide_conf"
+        else
+            local error_msg=$(cat /tmp/touch_error)
+            log_message "ERROR: Failed to create $aide_conf - Error: $error_msg"
+            echo "Failed to create $aide_conf. Exiting."
+            rm -f /tmp/touch_error
             return 1
         fi
     fi
 
-    # Ensure config directory exists and is writable
-    mkdir -p "$aide_conf_dir" || {
-        log_message "ERROR: Failed to create $aide_conf_dir"
+    # Ensure aide.conf is writable
+    if [[ ! -w "$aide_conf" ]]; then
+        log_message "ERROR: $aide_conf is not writable"
+        echo "$aide_conf is not writable. Exiting."
         return 1
-    }
-    for file in "$aide_conf" "$aide_conf_dir"; do
-        if [[ ! -w "$file" ]]; then
-            log_message "ERROR: $file is not writable"
-            return 1
-        fi
-    done
+    fi
 
-    # Add exclusions (CIS 5.2.1)
-    local exclusions=(
-        "^!/var/lib/lxcfs/cgroup$ 70_aide_lxcfs"
-        "^!/var/lib/docker$ 70_aide_docker"
+    # Basic AIDE configuration (example, adjust as needed)
+    local aide_settings=(
+        "database=file:/var/lib/aide/aide.db"       # Default database location
+        "database_out=file:/var/lib/aide/aide.db.new"  # Output for updates
+        "/etc p+i+u+g+sha256"                      # Monitor /etc with permissions and hash
+        "/bin p+i+u+g+sha256"                      # Monitor /bin
+        "/sbin p+i+u+g+sha256"                     # Monitor /sbin
+        "!/etc/aide/aide.conf"                     # Exclude aide.conf itself
     )
-    for excl in "${exclusions[@]}"; do
-        local pattern=$(echo "$excl" | cut -d' ' -f1)
-        local file="$aide_conf_dir/$(echo "$excl" | cut -d' ' -f2)"
-        if ! grep -R -E "$pattern" /etc/aide/* >/dev/null 2>&1; then
-            if echo "$pattern" > "$file" 2>/tmp/echo_error; then
-                chmod 0644 "$file"
-                log_message "INFO: Added exclusion $pattern to $file"
+    for setting in "${aide_settings[@]}"; do
+        if ! grep -qF "$setting" "$aide_conf" 2>/dev/null; then
+            if echo "$setting" >> "$aide_conf" 2>/tmp/echo_error; then
+                log_message "INFO: Added '$setting' to $aide_conf"
             else
                 local error_msg=$(cat /tmp/echo_error)
-                log_message "ERROR: Failed to add $pattern to $file - Error: $error_msg"
+                log_message "ERROR: Failed to add '$setting' to $aide_conf - Error: $error_msg"
+                echo "Failed to configure $aide_conf. Check $LOG_FILE for details."
                 rm -f /tmp/echo_error
                 return 1
             fi
         else
-            log_message "INFO: Exclusion $pattern already present"
+            log_message "INFO: '$setting' already present in $aide_conf"
         fi
     done
 
-    # Update checksums to sha512 (NIST SI-2)
-    if sed -i 's|^Checksums.*|Checksums = sha512|' "$aide_conf" 2>/tmp/sed_error; then
-        log_message "INFO: Updated checksums to sha512 in $aide_conf"
+    # Set permissions on aide.conf
+    if chmod 0640 "$aide_conf" 2>/tmp/chmod_error; then
+        log_message "INFO: Set permissions to 0640 on $aide_conf"
     else
-        local error_msg=$(cat /tmp/sed_error)
-        log_message "ERROR: Failed to update checksums in $aide_conf - Error: $error_msg"
-        rm -f /tmp/sed_error
+        local error_msg=$(cat /tmp/chmod_error)
+        log_message "ERROR: Failed to set permissions on $aide_conf - Error: $error_msg"
+        echo "Failed to set permissions on $aide_conf. Exiting."
+        rm -f /tmp/chmod_error
         return 1
     fi
-
-    # Verify configuration
-    if grep -q "Checksums = sha512" "$aide_conf"; then
-        log_message "INFO: Verified sha512 checksum setting in $aide_conf"
+    if chown root:root "$aide_conf" 2>/tmp/chown_error; then
+        log_message "INFO: Set ownership to root:root on $aide_conf"
     else
-        log_message "WARNING: sha512 checksum setting not applied in $aide_conf"
-    fi
-    rm -f /tmp/echo_error /tmp/sed_error /tmp/cp_error
-
-    ((SCRIPT_COUNT++))
-}
-
-function f_aide_post {
-    echo "[$SCRIPT_COUNT] Initializing AIDE database (this may take a while)"
-
-    # Check if running as root
-    if [[ $EUID -ne 0 ]]; then
-        echo "This function must be run as root" >&2
-        log_message "ERROR: Function must be run as root"
+        local error_msg=$(cat /tmp/chown_error)
+        log_message "ERROR: Failed to set ownership on $aide_conf - Error: $error_msg"
+        echo "Failed to set ownership on $aide_conf. Exiting."
+        rm -f /tmp/chown_error
         return 1
     fi
 
-    # Ensure aideinit is available (part of aide)
-    if ! command -v aideinit >/dev/null 2>&1; then
-        log_message "ERROR: aideinit not found, ensure aide is installed (should be caught in f_aide)"
-        return 1
-    fi
-
-    # Run aideinit
-    if aideinit --yes 2>/tmp/aideinit_error; then
-        log_message "INFO: Successfully initialized AIDE database"
+    # Initialize AIDE database
+    if aideinit 2>/tmp/aideinit_error; then
+        log_message "INFO: Successfully initialized AIDE database with aideinit"
     else
         local error_msg=$(cat /tmp/aideinit_error)
         log_message "ERROR: Failed to initialize AIDE database - Error: $error_msg"
+        echo "Failed to initialize AIDE database. Check $LOG_FILE for details."
         rm -f /tmp/aideinit_error
         return 1
     fi
-    rm -f /tmp/aideinit_error
 
-    # Verify database creation
-    if [[ -f "/var/lib/aide/aide.db.new" ]]; then
-        log_message "INFO: Verified AIDE database created at /var/lib/aide/aide.db.new"
+    # Verify AIDE configuration
+    local verified=true
+    if [[ -f "$aide_conf" ]] && grep -q "database=file:/var/lib/aide/aide.db" "$aide_conf" 2>/dev/null; then
+        log_message "INFO: Verified $aide_conf contains database setting"
     else
-        log_message "WARNING: AIDE database not found after initialization"
+        log_message "WARNING: $aide_conf missing or lacks database setting"
+        verified=false
     fi
+    if [[ -f /var/lib/aide/aide.db ]]; then
+        log_message "INFO: Verified AIDE database exists at /var/lib/aide/aide.db"
+    else
+        log_message "WARNING: AIDE database not found at /var/lib/aide/aide.db"
+        verified=false
+    fi
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified AIDE configuration and database initialization"
+    fi
+
+    rm -f /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/aideinit_error /tmp/cp_error /tmp/touch_error /tmp/apt_install_error
 
     ((SCRIPT_COUNT++))
 }
 
-function f_aide_timer {
-    echo "[$SCRIPT_COUNT] Configuring daily AIDE check"
-
-    # Check if running as root
-    if [[ $EUID -ne 0 ]]; then
-        echo "This function must be run as root" >&2
-        log_message "ERROR: Function must be run as root"
-        return 1
-    fi
-
-    # Skip if cron job already exists
-    if [[ ! -f /etc/cron.daily/aide ]]; then
-        # Ensure systemd is installed (for timer)
-        if ! dpkg -l | grep -q "^ii.*systemd"; then
-            log_message "WARNING: systemd package not found, required for AIDE timer"
-            log_message "INFO: Attempting to install systemd"
-            if $APT install -y systemd 2>/tmp/apt_install_error; then
-                log_message "INFO: Successfully installed systemd"
-            else
-                local error_msg=$(cat /tmp/apt_install_error)
-                log_message "ERROR: Failed to install systemd - Error: $error_msg"
-                rm -f /tmp/apt_install_error
-                return 1
-            fi
-        else
-            log_message "INFO: systemd package is already installed"
-        fi
-
-        # Copy service and timer files
-        local files=("./config/aidecheck.service" "./config/aidecheck.timer")
-        for src_file in "${files[@]}"; do
-            local dest_file="/etc/systemd/system/$(basename "$src_file")"
-            if [[ ! -f "$src_file" ]]; then
-                log_message "ERROR: $src_file not found in ./config/"
-                return 1
-            fi
-            if cp "$src_file" "$dest_file" 2>/tmp/cp_error; then
-                log_message "INFO: Copied $src_file to $dest_file"
-            else
-                local error_msg=$(cat /tmp/cp_error)
-                log_message "ERROR: Failed to copy $src_file to $dest_file - Error: $error_msg"
-                rm -f /tmp/cp_error
-                return 1
-            fi
-        done
-
-        # Set permissions
-        if chmod 0644 /etc/systemd/system/aidecheck.* 2>/tmp/chmod_error; then
-            log_message "INFO: Set permissions to 0644 on aidecheck files"
-        else
-            local error_msg=$(cat /tmp/chmod_error)
-            log_message "ERROR: Failed to set permissions on aidecheck files - Error: $error_msg"
-            rm -f /tmp/chmod_error
-            return 1
-        fi
-
-        # Configure timer
-        if systemctl reenable aidecheck.timer 2>/tmp/systemctl_error; then
-            log_message "INFO: Enabled aidecheck.timer"
-        else
-            local error_msg=$(cat /tmp/systemctl_error)
-            log_message "ERROR: Failed to enable aidecheck.timer - Error: $error_msg"
-            rm -f /tmp/systemctl_error
-            return 1
-        fi
-        if systemctl restart aidecheck.timer 2>/tmp/systemctl_error; then
-            log_message "INFO: Restarted aidecheck.timer"
-        else
-            local error_msg=$(cat /tmp/systemctl_error)
-            log_message "ERROR: Failed to restart aidecheck.timer - Error: $error_msg"
-            rm -f /tmp/systemctl_error
-            return 1
-        fi
-        if systemctl daemon-reload 2>/tmp/daemon_error; then
-            log_message "INFO: Reloaded systemd daemon for AIDE timer"
-        else
-            local error_msg=$(cat /tmp/daemon_error)
-            log_message "ERROR: Failed to reload systemd daemon - Error: $error_msg"
-            rm -f /tmp/daemon_error
-            return 1
-        fi
-
-        # Verify timer
-        if systemctl is-enabled aidecheck.timer >/dev/null 2>&1; then
-            log_message "INFO: Verified aidecheck.timer is enabled"
-        else
-            log_message "WARNING: aidecheck.timer not enabled as expected"
-        fi
-
-        # Show status if verbose
-        if [[ "$VERBOSE" == "Y" ]]; then
-            systemctl status aidecheck.timer --no-pager
-            echo
-        fi
-        rm -f /tmp/systemctl_error /tmp/daemon_error /tmp/chmod_error /tmp/cp_error /tmp/apt_install_error
-
-        ((SCRIPT_COUNT++))
-    else
-        log_message "INFO: Daily AIDE check already configured via /etc/cron.daily/aide, skipping"
-    fi
-}
-
-# Example usage
-f_aide
-f_aide_post
-f_aide_timer
+# Example usage (assuming sourced in main script)
+# f_aide
