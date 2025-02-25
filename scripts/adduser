@@ -1,10 +1,12 @@
-#!/bin/bash
-
-# Additional configuration for this script
-LOG_FILE="/var/log/user_hardening.log"
-BACKUP_DIR="/root/backups"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-SCRIPT_COUNT=0
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# ADDUSER='/etc/adduser.conf'
+# USERADD='/etc/default/useradd'
+# APT='apt-get'
 
 # Function to log messages
 log_message() {
@@ -12,31 +14,57 @@ log_message() {
 }
 
 function f_adduser {
+    echo "[$SCRIPT_COUNT] Hardening user account creation and home directories"
+
     # Check if running as root
     if [[ $EUID -ne 0 ]]; then
         echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
         return 1
     fi
-    # Create backup directory if it doesn't exist
+
+    # Ensure required packages are installed (adduser, passwd for useradd)
+    local required_pkgs=("adduser" "passwd")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg is not installed, required for user management"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+    rm -f /tmp/apt_install_error
+
+    # Backup configuration files
     mkdir -p "$BACKUP_DIR" || {
-        log_message "ERROR: Failed to create backup directory"
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
         return 1
     }
-
-    # Backup original config files
-    cp "$ADDUSER" "$BACKUP_DIR/adduser.conf.$TIMESTAMP" && \
-    cp "$USERADD" "$BACKUP_DIR/useradd.$TIMESTAMP" || {
-        log_message "ERROR: Failed to create backups"
-        return 1
-    }
-    
-    log_message "INFO: Created backups in $BACKUP_DIR"
-
-    # Check if config files exist and are writable
-    for file in "$ADDUSER" "$USERADD"; do
-        if [[ ! -f "$file" ]]; then
-            log_message "ERROR: $file not found"
-            return 1
+    local config_files=("$ADDUSER" "$USERADD")
+    for file in "${config_files[@]}"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        else
+            log_message "WARNING: $file not found, creating it"
+            touch "$file" || {
+                log_message "ERROR: Failed to create $file"
+                return 1
+            }
         fi
         if [[ ! -w "$file" ]]; then
             log_message "ERROR: $file is not writable"
@@ -44,46 +72,80 @@ function f_adduser {
         fi
     done
 
-    # Modify adduser.conf
+    # Modify adduser.conf (CIS 6.2.2)
     local settings=(
-        "s/^DIR_MODE=.*/DIR_MODE=0750/"
-        "s/^#DIR_MODE=.*/DIR_MODE=0750/"
-        "s/^DSHELL=.*/DSHELL=\/bin\/false/"
-        "s/^#DSHELL=.*/DSHELL=\/bin\/false/"
-        "s/^USERGROUPS=.*/USERGROUPS=yes/"
-        "s/^#USERGROUPS=.*/USERGROUPS=yes/"
+        "s|^DIR_MODE=.*|DIR_MODE=0750|"  # Secure home dir perms
+        "s|^#DIR_MODE=.*|DIR_MODE=0750|"
+        "s|^DSHELL=.*|DSHELL=/bin/false|"  # Non-login shell
+        "s|^#DSHELL=.*|DSHELL=/bin/false|"
+        "s|^USERGROUPS=.*|USERGROUPS=yes|"  # Private groups
+        "s|^#USERGROUPS=.*|USERGROUPS=yes|"
     )
-    
     for setting in "${settings[@]}"; do
-        sed -i "$setting" "$ADDUSER" && \
-            log_message "INFO: Successfully applied $setting to $ADDUSER" || \
-            log_message "ERROR: Failed to apply $setting to $ADDUSER"
+        if sed -i "$setting" "$ADDUSER" 2>/tmp/sed_error; then
+            log_message "INFO: Successfully applied $setting to $ADDUSER"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to apply $setting to $ADDUSER - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1  # Critical failure, exit
+        fi
     done
 
-    # Modify useradd defaults
-    sed -i "s/^SHELL=.*/SHELL=\/bin\/false/" "$USERADD" && \
-        log_message "INFO: Set default shell to /bin/false" || \
-        log_message "ERROR: Failed to set default shell"
-    
-    sed -i "s/^# INACTIVE=.*/INACTIVE=30/" "$USERADD" && \
-        log_message "INFO: Set account inactivity to 30 days" || \
-        log_message "ERROR: Failed to set inactivity period"
+    # Modify useradd defaults (NIST AC-2)
+    if sed -i "s|^SHELL=.*|SHELL=/bin/false|" "$USERADD" 2>/tmp/sed_error; then
+        log_message "INFO: Set default shell to /bin/false in $USERADD"
+    else
+        local error_msg=$(cat /tmp/sed_error)
+        log_message "ERROR: Failed to set default shell in $USERADD - Error: $error_msg"
+        rm -f /tmp/sed_error
+        return 1
+    fi
+    if sed -i "s|^# INACTIVE=.*|INACTIVE=30|" "$USERADD" 2>/tmp/sed_error; then
+        log_message "INFO: Set account inactivity to 30 days in $USERADD"
+    else
+        local error_msg=$(cat /tmp/sed_error)
+        log_message "ERROR: Failed to set inactivity period in $USERADD - Error: $error_msg"
+        rm -f /tmp/sed_error
+        return 1
+    fi
 
-    # Harden existing user home directories
+    # Harden existing user home directories (CIS 6.2.8)
     local changed=0
     while IFS=':' read -r username _ _ uid _ home _; do
         # Skip system accounts and invalid entries
-        [[ "$uid" -lt 1000 || "$uid" -gt 65000 || -z "$home" ]] && continue
-        
+        if [[ "$uid" -lt 1000 || "$uid" -gt 65000 || -z "$home" ]]; then
+            continue
+        fi
         if [[ -d "$home" ]]; then
-            chmod 0750 "$home" 2>/dev/null && {
-                log_message "INFO: Hardened permissions on $home"
+            if chmod 0750 "$home" 2>/tmp/chmod_error; then
+                log_message "INFO: Hardened permissions to 0750 on $home for user $username"
                 ((changed++))
-            } || log_message "WARNING: Failed to harden $home"
+            else
+                local error_msg=$(cat /tmp/chmod_error)
+                log_message "WARNING: Failed to harden $home for user $username - Error: $error_msg"
+            fi
+            if chown "$username:" "$home" 2>/tmp/chown_error; then
+                log_message "INFO: Set ownership to $username on $home"
+            else
+                local error_msg=$(cat /tmp/chown_error)
+                log_message "WARNING: Failed to set ownership on $home for user $username - Error: $error_msg"
+            fi
+        else
+            log_message "INFO: Skipping $home for user $username - not a directory"
         fi
     done < /etc/passwd
-
     log_message "INFO: Modified permissions for $changed user directories"
+
+    # Verify key settings
+    if grep -q "DIR_MODE=0750" "$ADDUSER" && grep -q "DSHELL=/bin/false" "$ADDUSER" && grep -q "USERGROUPS=yes" "$ADDUSER" && \
+       grep -q "SHELL=/bin/false" "$USERADD" && grep -q "INACTIVE=30" "$USERADD"; then
+        log_message "INFO: Verified user hardening settings applied successfully"
+    else
+        log_message "WARNING: Some user hardening settings not applied as expected"
+    fi
+    rm -f /tmp/chmod_error /tmp/chown_error /tmp/sed_error /tmp/cp_error /tmp/apt_install_error
+
     echo "Hardening complete. Check $LOG_FILE for details"
     ((SCRIPT_COUNT++))
 }

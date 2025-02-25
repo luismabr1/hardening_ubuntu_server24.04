@@ -1,22 +1,250 @@
-function f_umask {
-  echo "[$SCRIPT_COUNT] umask"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+# HOSTS_EQUIV='/etc/hosts.equiv'
+# SECURETTY='/etc/securetty'
+# DEBUG_SHELL_SERVICE='debug-shell.service'
+# SSH_MODULI='/etc/ssh/moduli'
+# SSH_SERVICE='ssh.service'
+# SUDOERS_DIR='/etc/sudoers.d'
+# PAM_SU='/etc/pam.d/su'
+# SUDO_LOG='/var/log/sudo.log'
+# SUID_LIST='./misc/suid.list'
+# SHELLS_FILE='/etc/shells'
+# SYSCTL_SERVICE='systemd-sysctl.service'
+# ARPBIN='/usr/sbin/arp'
+# PINGBIN='/bin/ping'
+# DIGBIN='/usr/bin/dig'
+# TIMESYNCD_SERVICE='systemd-timesyncd.service'
+# UFW_SERVICE='ufw.service'
 
-  if [ -f /etc/init.d/rc ]; then
-    sed -i 's/umask 022/umask 077/g' /etc/init.d/rc
-  fi
+# New variables to add to global variables file:
+# RC_INIT='/etc/init.d/rc'            # Path to rc init script for umask setting
+# PROFILE='/etc/profile'              # Path to profile file for umask and session settings
+# BASHRC='/etc/bash.bashrc'           # Path to bashrc file for umask settings
+# PROFILE_D='/etc/profile.d'          # Directory for profile.d scripts, including autologout
+# AUTOLOGOUT_SH='/etc/profile.d/autologout.sh'  # Path to autologout script for TMOUT
 
-  if ! grep -q -i "umask" "/etc/profile" 2> /dev/null; then
-    echo "umask 077" >> /etc/profile
-  fi
-
-  if ! grep -q -i "umask" "/etc/bash.bashrc" 2> /dev/null; then
-    echo "umask 077" >> /etc/bash.bashrc
-  fi
-
-  if ! grep -q -i "TMOUT" "/etc/profile.d/*" 2> /dev/null; then
-    echo -e 'TMOUT=600\nreadonly TMOUT\nexport TMOUT' > '/etc/profile.d/autologout.sh'
-    chmod +x /etc/profile.d/autologout.sh
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_umask {
+    echo "[$SCRIPT_COUNT] Configuring umask and session timeout settings"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure coreutils is installed (for chmod, sed, etc.)
+    if ! dpkg -l | grep -q "^ii.*coreutils"; then
+        log_message "WARNING: coreutils package not found, required for umask configuration"
+        log_message "INFO: Attempting to install coreutils"
+        if $APT install -y coreutils 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed coreutils"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install coreutils - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: coreutils package is already installed"
+    fi
+
+    # Define file paths
+    local rc_init="/etc/init.d/rc"        # Using RC_INIT if defined
+    local profile="/etc/profile"          # Using PROFILE if defined
+    local bashrc="/etc/bash.bashrc"       # Using BASHRC if defined
+    local profile_d="/etc/profile.d"      # Using PROFILE_D if defined
+    local autologout_sh="$profile_d/autologout.sh"  # Using AUTOLOGOUT_SH if defined
+    local files=("$rc_init" "$profile" "$bashrc" "$autologout_sh")
+
+    # Backup files
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        fi
+    done
+
+    # Ensure files and directory exist and are writable
+    for file in "$rc_init" "$profile" "$bashrc"; do
+        if [[ ! -f "$file" ]]; then
+            log_message "WARNING: $file not found, creating it"
+            touch "$file" || {
+                log_message "ERROR: Failed to create $file"
+                return 1
+            }
+        fi
+        if [[ ! -w "$file" ]]; then
+            log_message "ERROR: $file is not writable"
+            return 1
+        fi
+    done
+    if [[ ! -d "$profile_d" ]]; then
+        if mkdir -p "$profile_d" 2>/tmp/mkdir_error; then
+            log_message "INFO: Created $profile_d directory"
+        else
+            local error_msg=$(cat /tmp/mkdir_error)
+            log_message "ERROR: Failed to create $profile_d directory - Error: $error_msg"
+            rm -f /tmp/mkdir_error
+            return 1
+        fi
+    fi
+
+    # Configure umask in rc init script (CIS 5.4.5)
+    if [[ -f "$rc_init" ]]; then
+        if sed -i 's/umask 022/umask 077/g' "$rc_init" 2>/tmp/sed_error; then
+            log_message "INFO: Updated umask to 077 in $rc_init"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to update umask in $rc_init - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    else
+        log_message "INFO: $rc_init not found, skipping umask update for rc script"
+    fi
+
+    # Configure umask in /etc/profile
+    if ! grep -q -i "^[#]*umask" "$profile" 2>/dev/null; then
+        if echo "umask 077" >> "$profile" 2>/tmp/echo_error; then
+            log_message "INFO: Added 'umask 077' to $profile"
+        else
+            local error_msg=$(cat /tmp/echo_error)
+            log_message "ERROR: Failed to add umask to $profile - Error: $error_msg"
+            rm -f /tmp/echo_error
+            return 1
+        fi
+    else
+        if sed -i 's|^[#]*umask.*|umask 077|' "$profile" 2>/tmp/sed_error; then
+            log_message "INFO: Updated existing umask to 077 in $profile"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to update umask in $profile - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    fi
+
+    # Configure umask in /etc/bash.bashrc
+    if ! grep -q -i "^[#]*umask" "$bashrc" 2>/dev/null; then
+        if echo "umask 077" >> "$bashrc" 2>/tmp/echo_error; then
+            log_message "INFO: Added 'umask 077' to $bashrc"
+        else
+            local error_msg=$(cat /tmp/echo_error)
+            log_message "ERROR: Failed to add umask to $bashrc - Error: $error_msg"
+            rm -f /tmp/echo_error
+            return 1
+        fi
+    else
+        if sed -i 's|^[#]*umask.*|umask 077|' "$bashrc" 2>/tmp/sed_error; then
+            log_message "INFO: Updated existing umask to 077 in $bashrc"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to update umask in $bashrc - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    fi
+
+    # Configure TMOUT in /etc/profile.d/autologout.sh (NIST AC-11)
+    if ! grep -q -i "^[#]*TMOUT" "$profile_d"/* 2>/tmp/grep_error; then
+        if echo -e 'TMOUT=600\nreadonly TMOUT\nexport TMOUT' > "$autologout_sh" 2>/tmp/echo_error; then
+            log_message "INFO: Created $autologout_sh with TMOUT=600"
+            if chmod +x "$autologout_sh" 2>/tmp/chmod_error; then
+                log_message "INFO: Set executable permissions on $autologout_sh"
+            else
+                local error_msg=$(cat /tmp/chmod_error)
+                log_message "ERROR: Failed to set executable permissions on $autologout_sh - Error: $error_msg"
+                rm -f /tmp/chmod_error
+                return 1
+            fi
+            if chown root:root "$autologout_sh" 2>/tmp/chown_error; then
+                log_message "INFO: Set ownership to root:root on $autologout_sh"
+            else
+                local error_msg=$(cat /tmp/chown_error)
+                log_message "ERROR: Failed to set ownership on $autologout_sh - Error: $error_msg"
+                rm -f /tmp/chown_error
+                return 1
+            fi
+        else
+            local error_msg=$(cat /tmp/echo_error)
+            log_message "ERROR: Failed to create $autologout_sh - Error: $error_msg"
+            rm -f /tmp/echo_error
+            return 1
+        fi
+    else
+        local autologout_exists=$(grep -l "^[#]*TMOUT" "$profile_d"/* 2>/dev/null || true)
+        if [[ -n "$autologout_exists" ]]; then
+            if sed -i 's|^[#]*TMOUT=.*|TMOUT=600|' "$autologout_exists" 2>/tmp/sed_error && \
+               sed -i '/^[#]*readonly TMOUT/d' "$autologout_exists" 2>/tmp/sed_error && \
+               echo "readonly TMOUT" >> "$autologout_exists" 2>/tmp/echo_error && \
+               sed -i '/^[#]*export TMOUT/d' "$autologout_exists" 2>/tmp/sed_error && \
+               echo "export TMOUT" >> "$autologout_exists" 2>/tmp/echo_error; then
+                log_message "INFO: Updated TMOUT to 600 in $autologout_exists"
+            else
+                local sed_error=$(cat /tmp/sed_error 2>/dev/null)
+                local echo_error=$(cat /tmp/echo_error 2>/dev/null)
+                log_message "ERROR: Failed to update TMOUT in $autologout_exists - Sed Error: $sed_error, Echo Error: $echo_error"
+                rm -f /tmp/sed_error /tmp/echo_error
+                return 1
+            fi
+        else
+            log_message "INFO: TMOUT already exists in $profile_d files, no update applied"
+        fi
+    fi
+
+    # Verify configuration
+    local verified=true
+    local files_to_check=("$rc_init" "$profile" "$bashrc")
+    for file in "${files_to_check[@]}"; do
+        if [[ -f "$file" ]] && ! grep -q "^[#]*umask 077" "$file" 2>/dev/null; then
+            log_message "WARNING: 'umask 077' not found in $file"
+            verified=false
+        fi
+    done
+    if [[ -f "$autologout_sh" ]]; then
+        if ! grep -q "^TMOUT=600" "$autologout_sh" 2>/dev/null || \
+           ! grep -q "^readonly TMOUT" "$autologout_sh" 2>/dev/null || \
+           ! grep -q "^export TMOUT" "$autologout_sh" 2>/dev/null; then
+            log_message "WARNING: TMOUT settings not fully applied in $autologout_sh"
+            verified=false
+        fi
+    fi
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified all umask and TMOUT settings applied"
+    fi
+    rm -f /tmp/sed_error /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/mkdir_error /tmp/grep_error /tmp/cp_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_umask

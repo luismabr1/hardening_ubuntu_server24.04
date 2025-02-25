@@ -1,28 +1,183 @@
-function f_cron {
-  echo "[$SCRIPT_COUNT] /etc/cron and /etc/at"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
 
-  rm /etc/cron.deny 2> /dev/null
-  rm /etc/at.deny 2> /dev/null
-
-  echo 'root' > /etc/cron.allow
-  echo 'root' > /etc/at.allow
-
-  chown root:root /etc/cron*
-  chmod og-rwx /etc/cron*
-
-  chown root:root /etc/at*
-  chmod og-rwx /etc/at*
-
-  systemctl mask atd.service
-  systemctl stop atd.service
-  systemctl daemon-reload
-
-  sed -i 's/^#cron./cron./' /etc/rsyslog.d/50-default.conf
-
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status atd.service --no-pager
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_cron {
+    echo "[$SCRIPT_COUNT] Configuring /etc/cron and /etc/at for security"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure required packages are installed (cron, at, rsyslog)
+    local required_pkgs=("cron" "at" "rsyslog")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg is not installed, required for cron/at configuration"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+    rm -f /tmp/apt_install_error
+
+    # Backup existing cron/at files
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in /etc/cron.allow /etc/cron.deny /etc/at.allow /etc/at.deny /etc/rsyslog.d/50-default.conf; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        fi
+    done
+
+    # Remove deny files
+    for deny_file in /etc/cron.deny /etc/at.deny; do
+        if [[ -f "$deny_file" ]]; then
+            if rm "$deny_file" 2>/tmp/rm_error; then
+                log_message "INFO: Removed $deny_file"
+            else
+                local error_msg=$(cat /tmp/rm_error)
+                log_message "ERROR: Failed to remove $deny_file - Error: $error_msg"
+                rm -f /tmp/rm_error
+                return 1
+            fi
+        else
+            log_message "INFO: $deny_file does not exist, no removal needed"
+        fi
+    done
+
+    # Restrict access to root only (CIS 5.1.8)
+    for allow_file in /etc/cron.allow /etc/at.allow; do
+        if echo 'root' > "$allow_file" 2>/tmp/echo_error; then
+            log_message "INFO: Set $allow_file to allow only root"
+        else
+            local error_msg=$(cat /tmp/echo_error)
+            log_message "ERROR: Failed to set $allow_file - Error: $error_msg"
+            rm -f /tmp/echo_error
+            return 1
+        fi
+    done
+
+    # Secure permissions on cron and at files (CIS 5.1.2-5.1.7)
+    if chown root:root /etc/cron* 2>/tmp/chown_cron_error; then
+        log_message "INFO: Set ownership to root:root on /etc/cron*"
+    else
+        local error_msg=$(cat /tmp/chown_cron_error)
+        log_message "ERROR: Failed to set ownership on /etc/cron* - Error: $error_msg"
+        rm -f /tmp/chown_cron_error
+        return 1
+    fi
+    if chmod og-rwx /etc/cron* 2>/tmp/chmod_cron_error; then
+        log_message "INFO: Set permissions to remove other/group access on /etc/cron*"
+    else
+        local error_msg=$(cat /tmp/chmod_cron_error)
+        log_message "ERROR: Failed to set permissions on /etc/cron* - Error: $error_msg"
+        rm -f /tmp/chmod_cron_error
+        return 1
+    fi
+
+    if chown root:root /etc/at* 2>/tmp/chown_at_error; then
+        log_message "INFO: Set ownership to root:root on /etc/at*"
+    else
+        local error_msg=$(cat /tmp/chown_at_error)
+        log_message "ERROR: Failed to set ownership on /etc/at* - Error: $error_msg"
+        rm -f /tmp/chown_at_error
+        return 1
+    fi
+    if chmod og-rwx /etc/at* 2>/tmp/chmod_at_error; then
+        log_message "INFO: Set permissions to remove other/group access on /etc/at*"
+    else
+        local error_msg=$(cat /tmp/chmod_at_error)
+        log_message "ERROR: Failed to set permissions on /etc/at* - Error: $error_msg"
+        rm -f /tmp/chmod_at_error
+        return 1
+    fi
+
+    # Disable atd service (CIS 2.2.3)
+    if systemctl mask atd.service 2>/tmp/mask_error; then
+        log_message "INFO: Masked atd.service"
+    else
+        local error_msg=$(cat /tmp/mask_error)
+        log_message "ERROR: Failed to mask atd.service - Error: $error_msg"
+        rm -f /tmp/mask_error
+        return 1
+    fi
+    if systemctl stop atd.service 2>/tmp/stop_error; then
+        log_message "INFO: Stopped atd.service"
+    else
+        local error_msg=$(cat /tmp/stop_error)
+        log_message "WARNING: Failed to stop atd.service - Error: $error_msg"  # Non-critical
+    fi
+    if systemctl daemon-reload 2>/tmp/daemon_error; then
+        log_message "INFO: Successfully reloaded systemd daemon"
+    else
+        local error_msg=$(cat /tmp/daemon_error)
+        log_message "ERROR: Failed to reload systemd daemon - Error: $error_msg"
+        rm -f /tmp/daemon_error
+        return 1
+    fi
+
+    # Enable cron logging via rsyslog (CIS 4.2.1)
+    local rsyslog_conf="/etc/rsyslog.d/50-default.conf"
+    if [[ -f "$rsyslog_conf" ]]; then
+        if sed -i 's|^#cron.|cron.|' "$rsyslog_conf" 2>/tmp/sed_error; then
+            log_message "INFO: Enabled cron logging in $rsyslog_conf"
+            if systemctl restart rsyslog 2>/tmp/rsyslog_error; then
+                log_message "INFO: Restarted rsyslog to apply logging changes"
+            else
+                local error_msg=$(cat /tmp/rsyslog_error)
+                log_message "ERROR: Failed to restart rsyslog - Error: $error_msg"
+                rm -f /tmp/rsyslog_error
+                return 1
+            fi
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to enable cron logging in $rsyslog_conf - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    else
+        log_message "WARNING: $rsyslog_conf not found, cron logging not configured"
+    fi
+    rm -f /tmp/sed_error /tmp/rsyslog_error /tmp/mask_error /tmp/stop_error /tmp/daemon_error /tmp/chown_cron_error /tmp/chmod_cron_error /tmp/chown_at_error /tmp/chmod_at_error /tmp/echo_error /tmp/cp_error /tmp/rm_error
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status atd.service --no-pager
+        echo
+    fi
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_cron

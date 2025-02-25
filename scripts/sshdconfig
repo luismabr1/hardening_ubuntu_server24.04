@@ -1,195 +1,420 @@
-# https://wiki.mozilla.org/Security/Guidelines/OpenSSH
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+# HOSTS_EQUIV='/etc/hosts.equiv'
+# SECURETTY='/etc/securetty'
+# DEBUG_SHELL_SERVICE='debug-shell.service'
+# SSHDFILE='/etc/ssh/sshd_config'
+# SSHFILE='/etc/ssh/ssh_config'
+# SSH_PORT='22'
+# SSH_GRPS='sudo'
+
+# New variables to add to global variables file:
+# SSH_MODULI='/etc/ssh/moduli'  # Path to SSH moduli file, added for secure key filtering
+# SSH_SERVICE='ssh.service'     # Defines SSH service name for consistency
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
 
 function f_sshdconfig {
-  echo "[$SCRIPT_COUNT] $SSHDFILE"
+    echo "[$SCRIPT_COUNT] Configuring $SSHDFILE for secure SSH server"
 
-  awk '$5 >= 3071' /etc/ssh/moduli > /etc/ssh/moduli.tmp
-  mv /etc/ssh/moduli.tmp /etc/ssh/moduli
-
-  if grep -q '^Include' /etc/ssh/sshd_config; then
-    local INCLUDEDIR
-    # shellcheck disable=SC2046
-    INCLUDEDIR="$(dirname $(grep '^Include' /etc/ssh/sshd_config | awk '{print $NF}'))"
-
-    if [ ! -d "$INCLUDEDIR" ]; then
-      mkdir -p "$INCLUDEDIR"
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
     fi
 
-    SSHDCONF="$INCLUDEDIR/hardening.conf"
+    # Ensure openssh-server is installed
+    if ! dpkg -l | grep -q "^ii.*openssh-server"; then
+        log_message "WARNING: openssh-server package not found, required for SSH configuration"
+        log_message "INFO: Attempting to install openssh-server"
+        if $APT install -y openssh-server 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed openssh-server"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install openssh-server - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: openssh-server package is already installed"
+    fi
 
-    cp "$SSHDFILE" "$SSHDCONF"
+    # Backup SSH files
+    local moduli_file="/etc/ssh/moduli"  # Using SSH_MODULI if defined
+    local files=("$SSHDFILE" "$moduli_file")
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        fi
+    done
 
-    sed -i '/.*Subsystem.*/d' "$SSHDFILE"
-    sed -i '/Include.*/d' "$SSHDCONF"
-  else
-    SSHDCONF="$SSHDFILE"
-  fi
+    # Filter moduli for secure key sizes (3071+ bits)
+    if [[ -f "$moduli_file" ]]; then
+        if awk '$5 >= 3071' "$moduli_file" > "$moduli_file.tmp" 2>/tmp/awk_error; then
+            if mv "$moduli_file.tmp" "$moduli_file" 2>/tmp/mv_error; then
+                log_message "INFO: Filtered $moduli_file to include only moduli >= 3071 bits"
+            else
+                local error_msg=$(cat /tmp/mv_error)
+                log_message "ERROR: Failed to replace $moduli_file - Error: $error_msg"
+                rm -f /tmp/mv_error
+                return 1
+            fi
+        else
+            local error_msg=$(cat /tmp/awk_error)
+            log_message "ERROR: Failed to filter $moduli_file - Error: $error_msg"
+            rm -f /tmp/awk_error
+            return 1
+        fi
+    else
+        log_message "WARNING: $moduli_file not found, skipping moduli filtering"
+    fi
 
+    # Determine SSHDCONF based on Include directive
+    local SSHDCONF="$SSHDFILE"
+    local INCLUDEDIR=""
+    if grep -q '^Include' "$SSHDFILE" 2>/dev/null; then
+        INCLUDEDIR=$(dirname "$(grep '^Include' "$SSHDFILE" | awk '{print $NF}' 2>/tmp/awk_error)")
+        if [[ $? -eq 0 ]]; then
+            if [[ ! -d "$INCLUDEDIR" ]]; then
+                if mkdir -p "$INCLUDEDIR" 2>/tmp/mkdir_error; then
+                    log_message "INFO: Created include directory $INCLUDEDIR"
+                else
+                    local error_msg=$(cat /tmp/mkdir_error)
+                    log_message "ERROR: Failed to create include directory $INCLUDEDIR - Error: $error_msg"
+                    rm -f /tmp/mkdir_error
+                    return 1
+                fi
+            fi
+            SSHDCONF="$INCLUDEDIR/hardening.conf"
+            if cp "$SSHDFILE" "$SSHDCONF" 2>/tmp/cp_error; then
+                log_message "INFO: Copied $SSHDFILE to $SSHDCONF for hardening"
+                if sed -i '/.*Subsystem.*/d' "$SSHDFILE" 2>/tmp/sed_error && \
+                   sed -i '/Include.*/d' "$SSHDCONF" 2>/tmp/sed_error; then
+                    log_message "INFO: Cleaned Subsystem and Include from $SSHDFILE and $SSHDCONF"
+                else
+                    local error_msg=$(cat /tmp/sed_error)
+                    log_message "ERROR: Failed to clean $SSHDFILE or $SSHDCONF - Error: $error_msg"
+                    rm -f /tmp/sed_error
+                    return 1
+                fi
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to copy $SSHDFILE to $SSHDCONF - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        else
+            local error_msg=$(cat /tmp/awk_error)
+            log_message "ERROR: Failed to parse Include directive in $SSHDFILE - Error: $error_msg"
+            rm -f /tmp/awk_error
+            return 1
+        fi
+    fi
+    [[ "$VERBOSE" == "Y" ]] && echo "Using $SSHDCONF"
+    log_message "INFO: Using SSHDCONF=$SSHDCONF for configuration"
 
-  if [[ $VERBOSE == "Y" ]]; then
-    echo "Using $SSHDCONF"
-  fi
+    # Ensure SSHDCONF is writable
+    if [[ ! -w "$SSHDCONF" ]]; then
+        log_message "ERROR: $SSHDCONF is not writable"
+        return 1
+    fi
 
-  sed -i '/HostKey.*ssh_host_dsa_key.*/d' "$SSHDCONF"
-  sed -i '/KeyRegenerationInterval.*/d' "$SSHDCONF"
-  sed -i '/ServerKeyBits.*/d' "$SSHDCONF"
-  sed -i '/UseLogin.*/d' "$SSHDCONF"
+    # Configure SSHDCONF (CIS 5.2.3, Mozilla SSH Guidelines)
+    local sshd_settings=(
+        "s|^[#]*X11Forwarding.*|X11Forwarding no|"                          # No X11 forwarding
+        "s|^[#]*LoginGraceTime.*|LoginGraceTime 20|"                       # 20s grace time
+        "s|^[#]*PermitRootLogin.*|PermitRootLogin no|"                     # No root login
+        "s|^[#]*UsePrivilegeSeparation.*|UsePrivilegeSeparation sandbox|"  # Sandbox privilege separation
+        "s|^[#]*LogLevel.*|LogLevel VERBOSE|"                             # Verbose logging
+        "s|^[#]*Banner.*|Banner /etc/issue.net|"                          # Custom banner
+        "s|^[#]*Subsystem.*sftp.*|Subsystem sftp internal-sftp|"          # Internal SFTP
+        "s|^[#]*Compression.*|Compression no|"                            # No compression
+        "s|^[#]*Port.*|Port $SSH_PORT|"                                   # Custom SSH port
+    )
+    for setting in "${sshd_settings[@]}"; do
+        if sed -i "$setting" "$SSHDCONF" 2>/tmp/sed_error; then
+            log_message "INFO: Applied $setting to $SSHDCONF"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to apply $setting to $SSHDCONF - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    done
 
-  sed -i 's/.*X11Forwarding.*/X11Forwarding no/' "$SSHDCONF"
-  sed -i 's/.*LoginGraceTime.*/LoginGraceTime 20/' "$SSHDCONF"
-  sed -i 's/.*PermitRootLogin.*/PermitRootLogin no/' "$SSHDCONF"
-  sed -i 's/.*UsePrivilegeSeparation.*/UsePrivilegeSeparation sandbox/' "$SSHDCONF"
-  sed -i 's/.*LogLevel.*/LogLevel VERBOSE/' "$SSHDCONF"
-  sed -i 's/.*Banner.*/Banner \/etc\/issue.net/' "$SSHDCONF"
-  sed -i 's/.*Subsystem.*sftp.*/Subsystem sftp internal-sftp/' "$SSHDCONF"
-  sed -i 's/^#.*Compression.*/Compression no/' "$SSHDCONF"
-  sed -i "s/.*Port.*/Port $SSH_PORT/" "$SSHDCONF"
+    # Remove deprecated settings
+    local deprecated_settings=("HostKey.*ssh_host_dsa_key" "KeyRegenerationInterval" "ServerKeyBits" "UseLogin")
+    for setting in "${deprecated_settings[@]}"; do
+        if sed -i "/$setting/d" "$SSHDCONF" 2>/tmp/sed_error; then
+            log_message "INFO: Removed deprecated setting matching '$setting' from $SSHDCONF"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            [[ -n "$error_msg" ]] && log_message "WARNING: Failed to remove '$setting' from $SSHDCONF - Error: $error_msg"
+        fi
+    done
 
-  echo "" >> "$SSHDCONF"
+    # Append additional settings if not present
+    local append_settings=(
+        "LogLevel VERBOSE"
+        "PrintLastLog yes"
+        "IgnoreUserKnownHosts yes"
+        "PermitEmptyPasswords no"
+        "AllowGroups $SSH_GRPS"
+        "MaxAuthTries 3"
+        "ClientAliveInterval 200"
+        "ClientAliveCountMax 3"
+        "PermitUserEnvironment no"
+        "KexAlgorithms curve25519-sha256@libssh.org,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha256"
+        "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes256-ctr"
+        "Macs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256"
+        "MaxSessions 3"
+        "UseDNS no"
+        "StrictModes yes"
+        "MaxStartups 10:30:60"
+        "HostbasedAuthentication no"
+        "KerberosAuthentication no"
+        "GSSAPIAuthentication no"
+        "RekeyLimit 512M 1h"
+        "AllowTcpForwarding no"
+        "AllowAgentForwarding no"
+        "TCPKeepAlive no"
+    )
+    for setting in "${append_settings[@]}"; do
+        if ! grep -q "^$setting" "$SSHDCONF" 2>/dev/null; then
+            if echo "$setting" >> "$SSHDCONF" 2>/tmp/echo_error; then
+                log_message "INFO: Appended '$setting' to $SSHDCONF"
+            else
+                local error_msg=$(cat /tmp/echo_error)
+                log_message "ERROR: Failed to append '$setting' to $SSHDCONF - Error: $error_msg"
+                rm -f /tmp/echo_error
+                return 1
+            fi
+        else
+            # Replace existing settings to ensure exact match
+            if sed -i "s|^[#]*$setting.*|$setting|" "$SSHDCONF" 2>/tmp/sed_error; then
+                log_message "INFO: Updated existing '$setting' in $SSHDCONF"
+            else
+                local error_msg=$(cat /tmp/sed_error)
+                log_message "ERROR: Failed to update '$setting' in $SSHDCONF - Error: $error_msg"
+                rm -f /tmp/sed_error
+                return 1
+            fi
+        fi
+    done
 
-  if ! grep -q "^LogLevel" "$SSHDCONF" 2> /dev/null; then
-    echo "LogLevel VERBOSE" >> "$SSHDCONF"
-  fi
+    # Clean and finalize SSHDCONF
+    local temp_conf="/etc/ssh/sshd_config.$TIMESTAMP"
+    if cp "$SSHDCONF" "$temp_conf" 2>/tmp/cp_error; then
+        if grep -vE '#|^$' "$temp_conf" | sort | uniq > "$SSHDCONF" 2>/tmp/grep_error; then
+            if rm "$temp_conf" 2>/tmp/rm_error; then
+                log_message "INFO: Cleaned and finalized $SSHDCONF (removed comments and duplicates)"
+            else
+                local error_msg=$(cat /tmp/rm_error)
+                log_message "ERROR: Failed to remove temporary $temp_conf - Error: $error_msg"
+                rm -f /tmp/rm_error
+                return 1
+            fi
+        else
+            local error_msg=$(cat /tmp/grep_error)
+            log_message "ERROR: Failed to clean $SSHDCONF - Error: $error_msg"
+            rm -f /tmp/grep_error
+            return 1
+        fi
+    else
+        local error_msg=$(cat /tmp/cp_error)
+        log_message "ERROR: Failed to copy $SSHDCONF to $temp_conf - Error: $error_msg"
+        rm -f /tmp/cp_error
+        return 1
+    fi
+    if chown root:root "$SSHDCONF" 2>/tmp/chown_error; then
+        log_message "INFO: Set ownership to root:root on $SSHDCONF"
+    else
+        local error_msg=$(cat /tmp/chown_error)
+        log_message "ERROR: Failed to set ownership on $SSHDCONF - Error: $error_msg"
+        rm -f /tmp/chown_error
+        return 1
+    fi
+    if chmod 0600 "$SSHDCONF" 2>/tmp/chmod_error; then
+        log_message "INFO: Set permissions to 0600 on $SSHDCONF"
+    else
+        local error_msg=$(cat /tmp/chmod_error)
+        log_message "ERROR: Failed to set permissions on $SSHDCONF - Error: $error_msg"
+        rm -f /tmp/chmod_error
+        return 1
+    fi
 
-  if ! grep -q "^PrintLastLog" "$SSHDCONF" 2> /dev/null; then
-    echo "PrintLastLog yes" >> "$SSHDCONF"
-  fi
+    # Restart SSH service
+    if systemctl restart ssh.service 2>/tmp/ssh_restart_error; then
+        log_message "INFO: Successfully restarted ssh.service"
+    else
+        local error_msg=$(cat /tmp/ssh_restart_error)
+        log_message "ERROR: Failed to restart ssh.service - Error: $error_msg"
+        rm -f /tmp/ssh_restart_error
+        return 1
+    fi
 
-  if ! grep -q "^IgnoreUserKnownHosts" "$SSHDCONF" 2> /dev/null; then
-    echo "IgnoreUserKnownHosts yes" >> "$SSHDCONF"
-  fi
+    # Verify key settings
+    local verified=true
+    local settings_to_check=(
+        "PermitRootLogin no"
+        "MaxAuthTries 3"
+        "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes256-ctr"
+        "UseDNS no"
+    )
+    for setting in "${settings_to_check[@]}"; do
+        if ! grep -q "^$setting" "$SSHDCONF" 2>/dev/null; then
+            log_message "WARNING: Setting '$setting' not found in $SSHDCONF as expected"
+            verified=false
+        fi
+    done
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified key SSH server configuration settings"
+    fi
 
-  if ! grep -q "^PermitEmptyPasswords" "$SSHDCONF" 2> /dev/null; then
-    echo "PermitEmptyPasswords no" >> "$SSHDCONF"
-  fi
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status ssh.service --no-pager
+        echo
+    fi
+    rm -f /tmp/sed_error /tmp/echo_error /tmp/grep_error /tmp/rm_error /tmp/chown_error /tmp/chmod_error /tmp/ssh_restart_error /tmp/awk_error /tmp/mkdir_error /tmp/cp_error /tmp/apt_install_error
 
-  if ! grep -q "^AllowGroups" "$SSHDCONF" 2> /dev/null; then
-    echo "AllowGroups $SSH_GRPS" >> "$SSHDCONF"
-  fi
-
-  if ! grep -q "^MaxAuthTries" "$SSHDCONF" 2> /dev/null; then
-    echo "MaxAuthTries 3" >> "$SSHDCONF"
-  else
-    sed -i 's/MaxAuthTries.*/MaxAuthTries 3/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^ClientAliveInterval" "$SSHDCONF" 2> /dev/null; then
-    echo "ClientAliveInterval 200" >> "$SSHDCONF"
-  fi
-
-  if ! grep -q "^ClientAliveCountMax" "$SSHDCONF" 2> /dev/null; then
-    echo "ClientAliveCountMax 3" >> "$SSHDCONF"
-  fi
-
-  if ! grep -q "^PermitUserEnvironment" "$SSHDCONF" 2> /dev/null; then
-    echo "PermitUserEnvironment no" >> "$SSHDCONF"
-  fi
-
-  if ! grep -q "^KexAlgorithms" "$SSHDCONF" 2> /dev/null; then
-    echo 'KexAlgorithms curve25519-sha256@libssh.org,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha256' >> "$SSHDCONF"
-  fi
-
-  if ! grep -q "^Ciphers" "$SSHDCONF" 2> /dev/null; then
-    echo 'Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes256-ctr' >> "$SSHDCONF"
-  fi
-
-  if ! grep -q "^Macs" "$SSHDCONF" 2> /dev/null; then
-    echo 'Macs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256' >> "$SSHDCONF"
-  fi
-
-  if ! grep -q "^MaxSessions" "$SSHDCONF" 2> /dev/null; then
-    echo "MaxSessions 3" >> "$SSHDCONF"
-  else
-    sed -i 's/MaxSessions.*/MaxSessions 3/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^UseDNS" "$SSHDCONF" 2> /dev/null; then
-    echo "UseDNS no" >> "$SSHDCONF"
-  else
-    sed -i 's/UseDNS.*/UseDNS no/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^StrictModes" "$SSHDCONF" 2> /dev/null; then
-    echo "StrictModes yes" >> "$SSHDCONF"
-  else
-    sed -i 's/StrictModes.*/StrictModes yes/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^MaxStartups" "$SSHDCONF" 2> /dev/null; then
-    echo "MaxStartups 10:30:60" >> "$SSHDCONF"
-  else
-    sed -i 's/MaxStartups.*/MaxStartups 10:30:60/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^HostbasedAuthentication" "$SSHDCONF" 2> /dev/null; then
-    echo "HostbasedAuthentication no" >> "$SSHDCONF"
-  else
-    sed -i 's/HostbasedAuthentication.*/HostbasedAuthentication no/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^KerberosAuthentication" "$SSHDCONF" 2> /dev/null; then
-    echo "KerberosAuthentication no" >> "$SSHDCONF"
-  else
-    sed -i 's/KerberosAuthentication.*/KerberosAuthentication no/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^GSSAPIAuthentication" "$SSHDCONF" 2> /dev/null; then
-    echo "GSSAPIAuthentication no" >> "$SSHDCONF"
-  else
-    sed -i 's/GSSAPIAuthentication.*/GSSAPIAuthentication no/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^RekeyLimit" "$SSHDCONF" 2> /dev/null; then
-    echo "RekeyLimit 512M 1h" >> "$SSHDCONF"
-  else
-    sed -i 's/RekeyLimit.*/RekeyLimit 512M 1h/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^AllowTcpForwarding" "$SSHDCONF" 2> /dev/null; then
-    echo "AllowTcpForwarding no" >> "$SSHDCONF"
-  else
-    sed -i 's/AllowTcpForwarding.*/AllowTcpForwarding no/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^AllowAgentForwarding" "$SSHDCONF" 2> /dev/null; then
-    echo "AllowAgentForwarding no" >> "$SSHDCONF"
-  else
-    sed -i 's/AllowAgentForwarding.*/AllowAgentForwarding no/' "$SSHDCONF"
-  fi
-
-  if ! grep -q "^TCPKeepAlive" "$SSHDCONF" 2> /dev/null; then
-    echo "TCPKeepAlive no" >> "$SSHDCONF"
-  else
-    sed -i 's/TCPKeepAlive.*/TCPKeepAlive no/' "$SSHDCONF"
-  fi
-
-  cp "$SSHDCONF" "/etc/ssh/sshd_config.$(date +%y%m%d)"
-  grep -vE '#|^$' "/etc/ssh/sshd_config.$(date +%y%m%d)" | sort | uniq > "$SSHDCONF"
-  rm "/etc/ssh/sshd_config.$(date +%y%m%d)"
-
-  chown root:root "$SSHDCONF"
-  chmod 0600 "$SSHDCONF"
-
-  systemctl restart ssh.service
-
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status ssh.service --no-pager
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+    ((SCRIPT_COUNT++))
 }
 
 function f_sshconfig {
-  echo "[$SCRIPT_COUNT] $SSHFILE"
+    echo "[$SCRIPT_COUNT] Configuring $SSHFILE for secure SSH client"
 
-  cp "$SSHFILE" "/etc/ssh/ssh_config.$(date +%y%m%d)"
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
 
-  if ! grep -q "^\s.*HashKnownHosts" "$SSHFILE" 2> /dev/null; then
-    sed -i '/HashKnownHosts/d' "$SSHFILE"
-    echo "    HashKnownHosts yes" >> "$SSHFILE"
-  fi
+    # Ensure openssh-client is installed
+    if ! dpkg -l | grep -q "^ii.*openssh-client"; then
+        log_message "WARNING: openssh-client package not found, required for SSH client configuration"
+        log_message "INFO: Attempting to install openssh-client"
+        if $APT install -y openssh-client 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed openssh-client"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install openssh-client - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: openssh-client package is already installed"
+    fi
 
-  sed -i 's/#.*Ciphers .*/    Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes256-ctr/g' "$SSHFILE"
-  sed -i 's/#.*MACs .*/    MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256/' "$SSHFILE"
+    # Backup SSH client config
+    if [[ -f "$SSHFILE" ]]; then
+        if cp "$SSHFILE" "$BACKUP_DIR/ssh_config.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $SSHFILE to $BACKUP_DIR/ssh_config.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $SSHFILE - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    else
+        log_message "WARNING: $SSHFILE not found, creating it"
+        touch "$SSHFILE" || {
+            log_message "ERROR: Failed to create $SSHFILE"
+            return 1
+        }
+    fi
+
+    # Ensure file is writable
+    if [[ ! -w "$SSHFILE" ]]; then
+        log_message "ERROR: $SSHFILE is not writable"
+        return 1
+    fi
+
+    # Configure SSH client settings (CIS 5.2.3, Mozilla SSH Guidelines)
+    if ! grep -q "^[#[:space:]]*HashKnownHosts" "$SSHFILE" 2>/dev/null; then
+        if sed -i '/HashKnownHosts/d' "$SSHFILE" 2>/tmp/sed_error && \
+           echo "    HashKnownHosts yes" >> "$SSHFILE" 2>/tmp/echo_error; then
+            log_message "INFO: Added 'HashKnownHosts yes' to $SSHFILE"
+        else
+            local sed_error=$(cat /tmp/sed_error 2>/dev/null)
+            local echo_error=$(cat /tmp/echo_error 2>/dev/null)
+            log_message "ERROR: Failed to add HashKnownHosts to $SSHFILE - Sed Error: $sed_error, Echo Error: $echo_error"
+            rm -f /tmp/sed_error /tmp/echo_error
+            return 1
+        fi
+    else
+        if sed -i 's|^[#[:space:]]*HashKnownHosts.*|    HashKnownHosts yes|' "$SSHFILE" 2>/tmp/sed_error; then
+            log_message "INFO: Updated 'HashKnownHosts yes' in $SSHFILE"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to update HashKnownHosts in $SSHFILE - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    fi
+
+    local ssh_settings=(
+        "s|^[#]*Ciphers.*|    Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes256-ctr|"
+        "s|^[#]*MACs.*|    MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256|"
+    )
+    for setting in "${ssh_settings[@]}"; do
+        if sed -i "$setting" "$SSHFILE" 2>/tmp/sed_error; then
+            log_message "INFO: Applied $setting to $SSHFILE"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to apply $setting to $SSHFILE - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    done
+
+    # Verify SSH client settings
+    local verified=true
+    local client_settings_to_check=(
+        "HashKnownHosts yes"
+        "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes256-ctr"
+        "MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256"
+    )
+    for setting in "${client_settings_to_check[@]}"; do
+        if ! grep -q "$setting" "$SSHFILE" 2>/dev/null; then
+            log_message "WARNING: Setting '$setting' not found in $SSHFILE as expected"
+            verified=false
+        fi
+    done
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified key SSH client configuration settings"
+    fi
+    rm -f /tmp/sed_error /tmp/echo_error /tmp/cp_error /tmp/apt_install_error
 }
+
+# Example usage (assuming part of larger script)
+# f_sshdconfig
+# f_sshconfig

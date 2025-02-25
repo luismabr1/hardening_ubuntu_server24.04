@@ -1,13 +1,126 @@
-function f_disablenet {
-  echo "[$SCRIPT_COUNT] Disable misc network protocols"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# DISABLENET='/etc/modprobe.d/disablenet.conf'
+# APT='apt-get'
 
-  local NET
-  NET="dccp sctp rds tipc"
-  for disable in $NET; do
-    if ! grep -q "$disable" "$DISABLENET" 2> /dev/null; then
-      echo "install $disable /bin/true" >> "$DISABLENET"
-    fi
-  done
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_disablenet {
+    echo "[$SCRIPT_COUNT] Disabling miscellaneous network protocols"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure modprobe is available (part of kmod package)
+    if ! command -v modprobe >/dev/null 2>&1; then
+        log_message "WARNING: kmod package not found, required for network protocol disabling"
+        log_message "INFO: Attempting to install kmod"
+        if $APT install -y kmod 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed kmod"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install kmod - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: kmod package is already installed"
+    fi
+    rm -f /tmp/apt_install_error
+
+    # Backup DISABLENET file if it exists
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "$DISABLENET" ]]; then
+        if cp "$DISABLENET" "$BACKUP_DIR/disablenet.conf.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $DISABLENET to $BACKUP_DIR/disablenet.conf.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $DISABLENET - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    fi
+
+    # Ensure DISABLENET directory exists and file is writable
+    mkdir -p "$(dirname "$DISABLENET")" || {
+        log_message "ERROR: Failed to create directory $(dirname "$DISABLENET")"
+        return 1
+    }
+    if [[ ! -f "$DISABLENET" ]]; then
+        touch "$DISABLENET" || {
+            log_message "ERROR: Failed to create $DISABLENET"
+            return 1
+        }
+    fi
+    if [[ ! -w "$DISABLENET" ]]; then
+        log_message "ERROR: $DISABLENET is not writable"
+        return 1
+    fi
+
+    # List of network protocols to disable (CIS 1.1.3, NIST CM-7)
+    local NET="dccp sctp rds tipc"
+    local disabled_count=0
+    for disable in $NET; do
+        if ! grep -q "^install $disable /bin/true" "$DISABLENET" 2>/tmp/grep_error; then
+            if echo "install $disable /bin/true" >> "$DISABLENET" 2>/tmp/echo_error; then
+                log_message "INFO: Disabled $disable network protocol in $DISABLENET"
+                ((disabled_count++))
+            else
+                local error_msg=$(cat /tmp/echo_error)
+                log_message "ERROR: Failed to disable $disable in $DISABLENET - Error: $error_msg"
+                rm -f /tmp/echo_error
+                return 1
+            fi
+        else
+            log_message "INFO: $disable network protocol already disabled in $DISABLENET"
+        fi
+    done
+
+    # Set secure permissions on DISABLENET (CIS 1.1.3)
+    if chmod 0640 "$DISABLENET" 2>/tmp/chmod_error; then
+        log_message "INFO: Set secure permissions (0640) on $DISABLENET"
+    else
+        local error_msg=$(cat /tmp/chmod_error)
+        log_message "ERROR: Failed to set permissions on $DISABLENET - Error: $error_msg"
+        rm -f /tmp/chmod_error
+        return 1
+    fi
+    if chown root:root "$DISABLENET" 2>/tmp/chown_error; then
+        log_message "INFO: Set ownership to root:root on $DISABLENET"
+    else
+        local error_msg=$(cat /tmp/chown_error)
+        log_message "ERROR: Failed to set ownership on $DISABLENET - Error: $error_msg"
+        rm -f /tmp/chown_error
+        return 1
+    fi
+
+    # Apply changes by updating modules (recommended for immediate effect)
+    if update-initramfs -u 2>/tmp/initramfs_error; then
+        log_message "INFO: Updated initramfs to apply network protocol disable changes (reboot recommended)"
+    else
+        local error_msg=$(cat /tmp/initramfs_error)
+        log_message "WARNING: Failed to update initramfs - Error: $error_msg - Changes apply on next reboot"
+    fi
+    rm -f /tmp/grep_error /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/initramfs_error /tmp/cp_error
+
+    log_message "INFO: Successfully disabled $disabled_count network protocols"
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_disablenet

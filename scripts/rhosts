@@ -1,18 +1,134 @@
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+
+# New variable to add to global variables file:
+# HOSTS_EQUIV='/etc/hosts.equiv'  # Path to system-wide hosts.equiv file, added for consistency and reference
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
 function f_rhosts {
-  echo "[$SCRIPT_COUNT] .rhosts"
+    echo "[$SCRIPT_COUNT] Removing .rhosts and hosts.equiv files to prevent unauthorized access"
 
-  while read -r hostpasswd; do
-    find "$hostpasswd" \( -name "hosts.equiv" -o -name ".rhosts" \) -exec rm -f {} \; 2> /dev/null
-
-    if [[ $VERBOSE == "Y" ]]; then
-      echo "$hostpasswd"
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
     fi
 
-  done <<< "$(awk -F ":" '{print $6}' /etc/passwd)"
+    # Ensure coreutils is installed (for awk, find, etc.)
+    if ! dpkg -l | grep -q "^ii.*coreutils"; then
+        log_message "WARNING: coreutils package not found, required for file operations"
+        log_message "INFO: Attempting to install coreutils"
+        if $APT install -y coreutils 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed coreutils"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install coreutils - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: coreutils package is already installed"
+    fi
 
-  if [[ -f /etc/hosts.equiv ]]; then
-    rm /etc/hosts.equiv
-  fi
+    # Backup /etc/passwd and /etc/hosts.equiv (if exists)
+    local passwd_file="/etc/passwd"
+    local hosts_equiv="/etc/hosts.equiv"  # Using HOSTS_EQUIV if defined in global vars
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "$passwd_file" "$hosts_equiv"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        fi
+    done
 
-  ((SCRIPT_COUNT++))
+    # Remove .rhosts and hosts.equiv from user home directories (CIS 5.1.1)
+    local removed_count=0
+    while IFS=':' read -r _ _ _ _ _ home _; do
+        if [[ -n "$home" && -d "$home" ]]; then
+            local files_found
+            files_found=$(find "$home" \( -name "hosts.equiv" -o -name ".rhosts" \) 2>/tmp/find_error)
+            if [[ $? -eq 0 ]]; then
+                if [[ -n "$files_found" ]]; then
+                    while IFS= read -r file; do
+                        if rm -f "$file" 2>/tmp/rm_error; then
+                            log_message "INFO: Removed $file from $home"
+                            ((removed_count++))
+                        else
+                            local error_msg=$(cat /tmp/rm_error)
+                            log_message "WARNING: Failed to remove $file from $home - Error: $error_msg"
+                        fi
+                    done <<< "$files_found"
+                fi
+                if [[ "$VERBOSE" == "Y" ]]; then
+                    echo "$home"
+                fi
+            else
+                local error_msg=$(cat /tmp/find_error)
+                log_message "WARNING: Failed to search $home for .rhosts/hosts.equiv - Error: $error_msg"
+            fi
+        fi
+    done < <(awk -F ":" '{print $6}' "$passwd_file" 2>/tmp/awk_error)
+    if [[ $? -ne 0 ]]; then
+        local error_msg=$(cat /tmp/awk_error)
+        log_message "ERROR: Failed to read home directories from $passwd_file - Error: $error_msg"
+        rm -f /tmp/awk_error
+        return 1
+    fi
+    log_message "INFO: Removed $removed_count .rhosts and hosts.equiv files from user home directories"
+
+    # Remove /etc/hosts.equiv
+    if [[ -f "$hosts_equiv" ]]; then
+        if rm "$hosts_equiv" 2>/tmp/rm_error; then
+            log_message "INFO: Removed system-wide $hosts_equiv"
+        else
+            local error_msg=$(cat /tmp/rm_error)
+            log_message "ERROR: Failed to remove $hosts_equiv - Error: $error_msg"
+            rm -f /tmp/rm_error
+            return 1
+        fi
+    else
+        log_message "INFO: $hosts_equiv does not exist, no action needed"
+    fi
+
+    # Verify removal
+    local verified=true
+    if find / -type f \( -name "hosts.equiv" -o -name ".rhosts" \) 2>/dev/null | grep -q '.'; then
+        log_message "WARNING: Some .rhosts or hosts.equiv files still exist on the system"
+        verified=false
+    fi
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified no .rhosts or hosts.equiv files remain"
+    fi
+    rm -f /tmp/find_error /tmp/rm_error /tmp/cp_error /tmp/awk_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
 }
+
+# Example usage (assuming part of larger script)
+# f_rhosts

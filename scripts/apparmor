@@ -1,27 +1,119 @@
-function f_aa_enforce {
-  if [[ $LXC == "1" ]]; then
-    return
-  fi
+# Assuming this is part of your larger script with variables like these:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# DEFAULTGRUB='/etc/default/grub.d'
+# VERBOSE='N'
+# SCRIPT_COUNT=0
 
-  echo "[$SCRIPT_COUNT] Enforce apparmor profiles"
-
-  if ! grep 'session.*pam_apparmor.so order=user,group,default' /etc/pam.d/*; then
-    echo 'session optional pam_apparmor.so order=user,group,default' > /etc/pam.d/apparmor
-  fi
-
-  if ! grep -q 'apparmor=1' /proc/cmdline; then
-    echo "GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX apparmor=1 security=apparmor\"" > "$DEFAULTGRUB/99-hardening-apparmor.cfg"
-  fi
-
-  systemctl enable apparmor.service
-  systemctl restart apparmor.service
-
-  find /etc/apparmor.d/ -maxdepth 1 -type f -exec aa-enforce {} \;
-
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status apparmor.service --no-pager
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages (assuming it's already defined)
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_aa_enforce {
+    # Skip if running in LXC environment
+    if [[ "$LXC" == "1" ]]; then
+        log_message "INFO: Skipping AppArmor enforcement in LXC environment"
+        return 0
+    fi
+
+    echo "[$SCRIPT_COUNT] Enforce AppArmor profiles"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        return 1
+    fi
+
+    # Ensure AppArmor is installed
+    if ! command -v aa-enforce >/dev/null 2>&1; then
+        log_message "ERROR: AppArmor tools not installed. Please install apparmor-utils (e.g., apt install apparmor-utils)"
+        return 1
+    fi
+
+    # Backup PAM configuration if modifying
+    local pam_file="/etc/pam.d/apparmor"
+    if ! grep -r 'session.*pam_apparmor.so order=user,group,default' /etc/pam.d/* >/dev/null 2>&1; then
+        mkdir -p "$BACKUP_DIR" || {
+            log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+            return 1
+        }
+        [[ -f "$pam_file" ]] && cp "$pam_file" "$BACKUP_DIR/apparmor.$TIMESTAMP" && \
+            log_message "INFO: Backed up $pam_file to $BACKUP_DIR/apparmor.$TIMESTAMP"
+        
+        if echo 'session optional pam_apparmor.so order=user,group,default' > "$pam_file"; then
+            chmod 0644 "$pam_file"  # Set proper permissions
+            log_message "INFO: Added PAM AppArmor session configuration to $pam_file"
+        else
+            log_message "ERROR: Failed to write to $pam_file"
+            return 1
+        fi
+    else
+        log_message "INFO: PAM AppArmor session configuration already present"
+    fi
+
+    # Configure GRUB for AppArmor
+    local grub_file="$DEFAULTGRUB/99-hardening-apparmor.cfg"
+    if ! grep -q 'apparmor=1' /proc/cmdline; then
+        mkdir -p "$DEFAULTGRUB" || {
+            log_message "ERROR: Failed to create directory $DEFAULTGRUB"
+            return 1
+        }
+        [[ -f "$grub_file" ]] && cp "$grub_file" "$BACKUP_DIR/99-hardening-apparmor.cfg.$TIMESTAMP" && \
+            log_message "INFO: Backed up $grub_file to $BACKUP_DIR/99-hardening-apparmor.cfg.$TIMESTAMP"
+        
+        if echo "GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX apparmor=1 security=apparmor\"" > "$grub_file"; then
+            chmod 0644 "$grub_file"
+            log_message "INFO: Added AppArmor parameters to $grub_file"
+            # Update GRUB (assuming Ubuntu)
+            if update-grub; then
+                log_message "INFO: Successfully updated GRUB configuration"
+            else
+                log_message "ERROR: Failed to update GRUB configuration"
+                return 1
+            fi
+        else
+            log_message "ERROR: Failed to write to $grub_file"
+            return 1
+        fi
+    else
+        log_message "INFO: AppArmor already enabled in kernel parameters"
+    fi
+
+    # Enable and restart AppArmor service
+    if systemctl enable apparmor.service && systemctl restart apparmor.service; then
+        log_message "INFO: Successfully enabled and restarted apparmor.service"
+    else
+        log_message "ERROR: Failed to enable or restart apparmor.service"
+        return 1
+    fi
+
+    # Enforce AppArmor profiles
+    local profiles_enforced=0
+    while IFS= read -r profile; do
+        if [[ -f "$profile" ]]; then
+            if aa-enforce "$profile" 2>/tmp/aa_error; then
+                log_message "INFO: Enforced AppArmor profile: $profile"
+                ((profiles_enforced++))
+            else
+                local error_msg=$(cat /tmp/aa_error)
+                log_message "WARNING: Failed to enforce $profile - Error: $error_msg"
+            fi
+        fi
+    done < <(find /etc/apparmor.d/ -maxdepth 1 -type f)
+    rm -f /tmp/aa_error  # Clean up temporary error file
+
+    log_message "INFO: Successfully enforced $profiles_enforced AppArmor profiles"
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status apparmor.service --no-pager
+        echo
+    fi
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_aa_enforce

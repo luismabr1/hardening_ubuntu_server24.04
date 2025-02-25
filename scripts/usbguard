@@ -1,18 +1,161 @@
-function f_usbguard {
-  echo "[$SCRIPT_COUNT] Enable usbguard"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+# HOSTS_EQUIV='/etc/hosts.equiv'
+# SECURETTY='/etc/securetty'
+# DEBUG_SHELL_SERVICE='debug-shell.service'
+# SSH_MODULI='/etc/ssh/moduli'
+# SSH_SERVICE='ssh.service'
+# SUDOERS_DIR='/etc/sudoers.d'
+# PAM_SU='/etc/pam.d/su'
+# SUDO_LOG='/var/log/sudo.log'
+# SUID_LIST='./misc/suid.list'
+# SHELLS_FILE='/etc/shells'
+# SYSCTL_SERVICE='systemd-sysctl.service'
+# ARPBIN='/usr/sbin/arp'
+# PINGBIN='/bin/ping'
+# DIGBIN='/usr/bin/dig'
+# TIMESYNCD_SERVICE='systemd-timesyncd.service'
+# UFW_SERVICE='ufw.service'
+# RC_INIT='/etc/init.d/rc'
+# PROFILE='/etc/profile'
+# BASHRC='/etc/bash.bashrc'
+# PROFILE_D='/etc/profile.d'
+# AUTOLOGOUT_SH='/etc/profile.d/autologout.sh'
 
-  $APT install --no-install-recommends usbguard
+# New variables to add to global variables file:
+# USBGUARD_CONF='/etc/usbguard/rules.conf'  # Path to USBGuard rules configuration file
+# USBGUARD_SERVICE='usbguard.service'       # Defines USBGuard service name for consistency
 
-  usbguard generate-policy > /tmp/rules.conf
-  install -m 0600 -o root -g root /tmp/rules.conf /etc/usbguard/rules.conf
-
-  systemctl enable usbguard.service
-  systemctl start usbguard.service
-
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status usbguard.service --no-pager
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_usbguard {
+    echo "[$SCRIPT_COUNT] Enabling and configuring USBGuard for USB device control"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure usbguard is installed
+    if ! dpkg -l | grep -q "^ii.*usbguard"; then
+        log_message "INFO: usbguard package not found, installing"
+        if $APT install -y --no-install-recommends usbguard 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed usbguard"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install usbguard - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: usbguard package is already installed"
+    fi
+
+    # Backup existing USBGuard rules.conf if it exists
+    local usbguard_conf="/etc/usbguard/rules.conf"  # Using USBGUARD_CONF if defined
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "$usbguard_conf" ]]; then
+        if cp "$usbguard_conf" "$BACKUP_DIR/rules.conf.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $usbguard_conf to $BACKUP_DIR/rules.conf.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $usbguard_conf - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    fi
+
+    # Generate and install USBGuard policy (CIS 2.2.16)
+    local tmp_rules="/tmp/rules.conf"
+    if usbguard generate-policy > "$tmp_rules" 2>/tmp/usbguard_error; then
+        log_message "INFO: Generated USBGuard policy in $tmp_rules"
+        if install -m 0600 -o root -g root "$tmp_rules" "$usbguard_conf" 2>/tmp/install_error; then
+            log_message "INFO: Installed USBGuard policy to $usbguard_conf with 0600 permissions"
+            if rm "$tmp_rules" 2>/tmp/rm_error; then
+                log_message "INFO: Removed temporary policy file $tmp_rules"
+            else
+                local error_msg=$(cat /tmp/rm_error)
+                log_message "WARNING: Failed to remove temporary policy file $tmp_rules - Error: $error_msg"
+            fi
+        else
+            local error_msg=$(cat /tmp/install_error)
+            log_message "ERROR: Failed to install USBGuard policy to $usbguard_conf - Error: $error_msg"
+            rm -f /tmp/install_error "$tmp_rules"
+            return 1
+        fi
+    else
+        local error_msg=$(cat /tmp/usbguard_error)
+        log_message "ERROR: Failed to generate USBGuard policy - Error: $error_msg"
+        rm -f /tmp/usbguard_error "$tmp_rules"
+        return 1
+    fi
+
+    # Enable and start usbguard service
+    if systemctl enable usbguard.service 2>/tmp/enable_error; then
+        log_message "INFO: Enabled usbguard.service"
+    else
+        local error_msg=$(cat /tmp/enable_error)
+        log_message "ERROR: Failed to enable usbguard.service - Error: $error_msg"
+        rm -f /tmp/enable_error
+        return 1
+    fi
+    if systemctl start usbguard.service 2>/tmp/start_error; then
+        log_message "INFO: Started usbguard.service"
+    else
+        local error_msg=$(cat /tmp/start_error)
+        log_message "ERROR: Failed to start usbguard.service - Error: $error_msg"
+        rm -f /tmp/start_error
+        return 1
+    fi
+
+    # Verify USBGuard configuration
+    local verified=true
+    if [[ -f "$usbguard_conf" ]] && [[ "$(stat -c '%a' "$usbguard_conf" 2>/dev/null)" == "600" ]] && \
+       [[ "$(stat -c '%U:%G' "$usbguard_conf" 2>/dev/null)" == "root:root" ]]; then
+        log_message "INFO: Verified $usbguard_conf exists with correct permissions and ownership"
+    else
+        log_message "WARNING: $usbguard_conf does not exist or has incorrect permissions/ownership"
+        verified=false
+    fi
+    if systemctl is-enabled usbguard.service >/dev/null 2>&1 && systemctl is-active usbguard.service >/dev/null 2>&1; then
+        log_message "INFO: Verified usbguard.service is enabled and active"
+    else
+        log_message "WARNING: usbguard.service is not enabled or active"
+        verified=false
+    fi
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified all USBGuard configuration settings"
+    fi
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status usbguard.service --no-pager
+        echo
+    fi
+    rm -f /tmp/usbguard_error /tmp/install_error /tmp/rm_error /tmp/enable_error /tmp/start_error /tmp/cp_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_usbguard

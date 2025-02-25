@@ -1,11 +1,135 @@
-function f_path {
-  echo "[$SCRIPT_COUNT] Modifying paths"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
 
-  sed -i 's/PATH=.*/PATH=\"\/usr\/local\/bin:\/usr\/sbin:\/usr\/bin:\/bin:\/snap\/bin"/' /etc/environment
-  cp ./config/initpath.sh /etc/profile.d/initpath.sh
-
-  chown root:root /etc/profile.d/initpath.sh
-  chmod 0644 /etc/profile.d/initpath.sh
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_path {
+    echo "[$SCRIPT_COUNT] Modifying system-wide PATH settings"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure coreutils is installed (for sed, cp, etc.)
+    if ! dpkg -l | grep -q "^ii.*coreutils"; then
+        log_message "WARNING: coreutils package not found, required for file operations"
+        log_message "INFO: Attempting to install coreutils"
+        if $APT install -y coreutils 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed coreutils"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install coreutils - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: coreutils package is already installed"
+    fi
+    rm -f /tmp/apt_install_error
+
+    # Backup /etc/environment
+    local env_file="/etc/environment"
+    local profile_dir="/etc/profile.d"
+    local initpath="$profile_dir/initpath.sh"
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "$env_file" ]]; then
+        if cp "$env_file" "$BACKUP_DIR/environment.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $env_file to $BACKUP_DIR/environment.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $env_file - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    else
+        log_message "WARNING: $env_file not found, creating it"
+        touch "$env_file" || {
+            log_message "ERROR: Failed to create $env_file"
+            return 1
+        }
+    fi
+
+    # Ensure files are writable
+    if [[ ! -w "$env_file" ]]; then
+        log_message "ERROR: $env_file is not writable"
+        return 1
+    fi
+
+    # Update PATH in /etc/environment (CIS 6.1.1)
+    local new_path="PATH=\"/usr/local/bin:/usr/sbin:/usr/bin:/bin:/snap/bin\""
+    if sed -i "s|^[#]*PATH=.*|$new_path|" "$env_file" 2>/tmp/sed_error; then
+        log_message "INFO: Updated PATH to $new_path in $env_file"
+    else
+        local error_msg=$(cat /tmp/sed_error)
+        log_message "ERROR: Failed to update PATH in $env_file - Error: $error_msg"
+        rm -f /tmp/sed_error
+        return 1
+    fi
+
+    # Copy initpath.sh to /etc/profile.d
+    if [[ -f "./config/initpath.sh" ]]; then
+        mkdir -p "$profile_dir" || {
+            log_message "ERROR: Failed to create $profile_dir"
+            return 1
+        }
+        if cp "./config/initpath.sh" "$initpath" 2>/tmp/cp_error; then
+            log_message "INFO: Copied ./config/initpath.sh to $initpath"
+            if chown root:root "$initpath" 2>/tmp/chown_error; then
+                log_message "INFO: Set ownership to root:root on $initpath"
+            else
+                local error_msg=$(cat /tmp/chown_error)
+                log_message "ERROR: Failed to set ownership on $initpath - Error: $error_msg"
+                rm -f /tmp/chown_error
+                return 1
+            fi
+            if chmod 0644 "$initpath" 2>/tmp/chmod_error; then
+                log_message "INFO: Set permissions to 0644 on $initpath"
+            else
+                local error_msg=$(cat /tmp/chmod_error)
+                log_message "ERROR: Failed to set permissions on $initpath - Error: $error_msg"
+                rm -f /tmp/chmod_error
+                return 1
+            fi
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to copy initpath.sh to $initpath - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    else
+        log_message "ERROR: ./config/initpath.sh not found, cannot configure profile.d PATH"
+        return 1
+    fi
+
+    # Verify PATH settings
+    if grep -q "^$new_path" "$env_file" 2>/dev/null; then
+        log_message "INFO: Verified PATH setting in $env_file"
+    else
+        log_message "WARNING: PATH not set to $new_path in $env_file as expected"
+    fi
+    if [[ -f "$initpath" ]] && [[ "$(stat -c '%u:%g' "$initpath")" == "0:0" ]] && [[ "$(stat -c '%a' "$initpath")" == "644" ]]; then
+        log_message "INFO: Verified $initpath ownership and permissions"
+    else
+        log_message "WARNING: $initpath ownership or permissions not set as expected"
+    fi
+    rm -f /tmp/sed_error /tmp/cp_error /tmp/chown_error /tmp/chmod_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_path

@@ -1,39 +1,213 @@
-function f_resolvedconf {
-  echo "[$SCRIPT_COUNT] Systemd/resolved.conf"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# RESOLVEDCONF='/etc/systemd/resolved.conf'
 
-  local dnsarray
-  local dnslist
+# New variable to add to global variables file:
+# NSSWITCH_CONF='/etc/nsswitch.conf'  # Path to nsswitch.conf, added for DNS resolution order configuration
 
-  mapfile -t dnsarray < <( grep ^nameserver /etc/resolv.conf | sed 's/^nameserver\s//g' )
-  dnslist=${dnsarray[*]}
-
-  if [ ${#dnsarray[@]} -lt 2 ]; then
-    dnslist="$dnslist 1.1.1.1"
-  fi
-
-  sed -i '/^nameserver/d' /etc/resolv.conf
-
-  for n in $dnslist; do
-    echo "nameserver $n" >> /etc/resolv.conf
-  done
-
-  if ! [[ -f "$RESOLVEDCONF" ]]; then
-    $APT install --no-install-recommends systemd-resolved
-  fi
-
-  sed -i "s/^#DNS=.*/DNS=$dnslist/" "$RESOLVEDCONF"
-  sed -i "s/^#FallbackDNS=.*/FallbackDNS=1.0.0.1/" "$RESOLVEDCONF"
-  sed -i "s/^#DNSSEC=.*/DNSSEC=allow-downgrade/" "$RESOLVEDCONF"
-  sed -i "s/^#DNSOverTLS=.*/DNSOverTLS=opportunistic/" "$RESOLVEDCONF"
-
-  sed -i '/^hosts:/ s/files dns/files resolve dns/' /etc/nsswitch.conf
-
-  systemctl daemon-reload
-
-  if [[ $VERBOSE == "Y" ]]; then
-    journalctl -r -n10 -u systemd-resolved --no-pager
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_resolvedconf {
+    echo "[$SCRIPT_COUNT] Configuring systemd/resolved.conf for secure DNS resolution"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure required packages are installed (coreutils for mapfile/sed, systemd-resolved)
+    local required_pkgs=("coreutils" "systemd")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg not found, required for DNS configuration"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+
+    # Backup configuration files
+    local resolv_conf="/etc/resolv.conf"
+    local nsswitch_conf="/etc/nsswitch.conf"  # Using NSSWITCH_CONF if defined in global vars
+    local files=("$RESOLVEDCONF" "$resolv_conf" "$nsswitch_conf")
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        fi
+    done
+
+    # Ensure files are writable
+    for file in "${files[@]}"; do
+        if [[ ! -f "$file" ]]; then
+            log_message "WARNING: $file not found, creating it"
+            touch "$file" || {
+                log_message "ERROR: Failed to create $file"
+                return 1
+            }
+        fi
+        if [[ ! -w "$file" ]]; then
+            log_message "ERROR: $file is not writable"
+            return 1
+        fi
+    done
+
+    # Extract and update DNS servers from /etc/resolv.conf
+    local dnsarray
+    local dnslist
+    mapfile -t dnsarray < <(grep '^nameserver' "$resolv_conf" | sed 's/^nameserver\s\+//g' 2>/tmp/grep_error)
+    if [[ $? -eq 0 ]]; then
+        dnslist="${dnsarray[*]}"
+        log_message "INFO: Extracted DNS servers from $resolv_conf: $dnslist"
+    else
+        local error_msg=$(cat /tmp/grep_error)
+        log_message "WARNING: Failed to extract DNS servers from $resolv_conf - Error: $error_msg, proceeding with empty list"
+        dnslist=""
+    fi
+
+    # Ensure at least two DNS servers
+    if [[ ${#dnsarray[@]} -lt 2 ]]; then
+        dnslist="$dnslist 1.1.1.1"
+        log_message "INFO: Added fallback DNS 1.1.1.1 as fewer than 2 servers were found"
+    fi
+
+    # Rewrite /etc/resolv.conf
+    if sed -i '/^nameserver/d' "$resolv_conf" 2>/tmp/sed_error; then
+        log_message "INFO: Removed existing nameserver entries from $resolv_conf"
+    else
+        local error_msg=$(cat /tmp/sed_error)
+        log_message "ERROR: Failed to remove nameserver entries from $resolv_conf - Error: $error_msg"
+        rm -f /tmp/sed_error
+        return 1
+    fi
+    for n in $dnslist; do
+        if echo "nameserver $n" >> "$resolv_conf" 2>/tmp/echo_error; then
+            log_message "INFO: Added nameserver $n to $resolv_conf"
+        else
+            local error_msg=$(cat /tmp/echo_error)
+            log_message "ERROR: Failed to add nameserver $n to $resolv_conf - Error: $error_msg"
+            rm -f /tmp/echo_error
+            return 1
+        fi
+    done
+
+    # Install systemd-resolved if not present
+    if [[ ! -f "$RESOLVEDCONF" ]]; then
+        if $APT install -y --no-install-recommends systemd-resolved 2>/tmp/install_error; then
+            log_message "INFO: Successfully installed systemd-resolved"
+        else
+            local error_msg=$(cat /tmp/install_error)
+            log_message "ERROR: Failed to install systemd-resolved - Error: $error_msg"
+            rm -f /tmp/install_error
+            return 1
+        fi
+    fi
+
+    # Configure resolved.conf (CIS 2.2.3, NIST CM-6)
+    local resolved_settings=(
+        "s|^[#]*DNS=.*|DNS=$dnslist|"                      # Primary DNS servers
+        "s|^[#]*FallbackDNS=.*|FallbackDNS=1.0.0.1|"      # Fallback DNS
+        "s|^[#]*DNSSEC=.*|DNSSEC=allow-downgrade|"        # DNSSEC downgrade allowed
+        "s|^[#]*DNSOverTLS=.*|DNSOverTLS=opportunistic|"  # Opportunistic TLS
+    )
+    for setting in "${resolved_settings[@]}"; do
+        if sed -i "$setting" "$RESOLVEDCONF" 2>/tmp/sed_error; then
+            log_message "INFO: Applied $setting to $RESOLVEDCONF"
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to apply $setting to $RESOLVEDCONF - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    done
+
+    # Update nsswitch.conf for resolve priority
+    if sed -i '/^hosts:/ s/files dns/files resolve dns/' "$nsswitch_conf" 2>/tmp/sed_error; then
+        log_message "INFO: Updated $nsswitch_conf to prioritize 'resolve' in hosts lookup"
+    else
+        local error_msg=$(cat /tmp/sed_error)
+        log_message "ERROR: Failed to update $nsswitch_conf - Error: $error_msg"
+        rm -f /tmp/sed_error
+        return 1
+    fi
+
+    # Reload systemd daemon
+    if systemctl daemon-reload 2>/tmp/daemon_error; then
+        log_message "INFO: Successfully reloaded systemd daemon"
+    else
+        local error_msg=$(cat /tmp/daemon_error)
+        log_message "ERROR: Failed to reload systemd daemon - Error: $error_msg"
+        rm -f /tmp/daemon_error
+        return 1
+    fi
+
+    # Verify configuration
+    local verified=true
+    local settings_to_check=(
+        "DNS=$dnslist"
+        "FallbackDNS=1.0.0.1"
+        "DNSSEC=allow-downgrade"
+        "DNSOverTLS=opportunistic"
+    )
+    for setting in "${settings_to_check[@]}"; do
+        if ! grep -q "^$setting" "$RESOLVEDCONF" 2>/dev/null; then
+            log_message "WARNING: Setting '$setting' not found in $RESOLVEDCONF as expected"
+            verified=false
+        fi
+    done
+    if grep -q "hosts:.*files resolve dns" "$nsswitch_conf" 2>/dev/null; then
+        log_message "INFO: Verified 'resolve' in hosts lookup order in $nsswitch_conf"
+    else
+        log_message "WARNING: 'resolve' not found in hosts lookup order in $nsswitch_conf"
+        verified=false
+    fi
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified all DNS resolution settings"
+    fi
+
+    # Show logs if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        journalctl -r -n10 -u systemd-resolved --no-pager
+        echo
+    fi
+    rm -f /tmp/grep_error /tmp/sed_error /tmp/echo_error /tmp/install_error /tmp/daemon_error /tmp/cp_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_resolvedconf

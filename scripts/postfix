@@ -1,17 +1,118 @@
-function f_postfix {
-  echo "[$SCRIPT_COUNT] Postfix"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'  # From previous script
 
-  postconf -e disable_vrfy_command=yes
-  postconf -e smtpd_banner="\$myhostname ESMTP"
-  postconf -e smtpd_client_restrictions=permit_mynetworks,reject
-  postconf -e inet_interfaces=loopback-only
+# New variable to add to global variables file:
+# POSTFIX_CONF='/etc/postfix/main.cf'  # Main Postfix configuration file, added for backup and verification
 
-  systemctl restart postfix.service
-
-  if [[ $VERBOSE == "Y" ]]; then
-    systemctl status postfix.service --no-pager
-    echo
-  fi
-
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_postfix {
+    echo "[$SCRIPT_COUNT] Configuring Postfix for secure mail handling"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure postfix is installed (required for postconf and service)
+    if ! dpkg -l | grep -q "^ii.*postfix"; then
+        log_message "WARNING: postfix package not found, required for mail configuration"
+        log_message "INFO: Attempting to install postfix"
+        if $APT install -y postfix 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed postfix"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install postfix - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: postfix package is already installed"
+    fi
+
+    # Backup Postfix main configuration file
+    local postfix_conf="/etc/postfix/main.cf"  # Using POSTFIX_CONF if defined in global vars
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    if [[ -f "$postfix_conf" ]]; then
+        if cp "$postfix_conf" "$BACKUP_DIR/main.cf.$TIMESTAMP" 2>/tmp/cp_error; then
+            log_message "INFO: Backed up $postfix_conf to $BACKUP_DIR/main.cf.$TIMESTAMP"
+        else
+            local error_msg=$(cat /tmp/cp_error)
+            log_message "ERROR: Failed to backup $postfix_conf - Error: $error_msg"
+            rm -f /tmp/cp_error
+            return 1
+        fi
+    else
+        log_message "ERROR: $postfix_conf not found, cannot configure Postfix"
+        return 1
+    fi
+
+    # Configure Postfix settings (CIS 2.2.11)
+    local postfix_settings=(
+        "disable_vrfy_command=yes"                     # Disable VRFY to prevent enumeration
+        "smtpd_banner=\$myhostname ESMTP"              # Minimal banner
+        "smtpd_client_restrictions=permit_mynetworks,reject"  # Restrict to local networks
+        "inet_interfaces=loopback-only"                # Limit to localhost
+    )
+    for setting in "${postfix_settings[@]}"; do
+        if postconf -e "$setting" 2>/tmp/postconf_error; then
+            log_message "INFO: Set Postfix parameter: $setting"
+        else
+            local error_msg=$(cat /tmp/postconf_error)
+            log_message "ERROR: Failed to set Postfix parameter '$setting' - Error: $error_msg"
+            rm -f /tmp/postconf_error
+            return 1
+        fi
+    done
+
+    # Restart Postfix service
+    if systemctl restart postfix.service 2>/tmp/systemctl_error; then
+        log_message "INFO: Successfully restarted postfix.service"
+    else
+        local error_msg=$(cat /tmp/systemctl_error)
+        log_message "ERROR: Failed to restart postfix.service - Error: $error_msg"
+        rm -f /tmp/systemctl_error
+        return 1
+    fi
+
+    # Verify Postfix configuration
+    local verified=true
+    for setting in "${postfix_settings[@]}"; do
+        local key=$(echo "$setting" | cut -d'=' -f1)
+        local expected_value=$(echo "$setting" | cut -d'=' -f2-)
+        if ! postconf "$key" 2>/dev/null | grep -q "$expected_value"; then
+            log_message "WARNING: Postfix setting '$key' not set to '$expected_value' as expected"
+            verified=false
+        fi
+    done
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified all Postfix configuration settings applied"
+    fi
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status postfix.service --no-pager
+        echo
+    fi
+    rm -f /tmp/postconf_error /tmp/systemctl_error /tmp/cp_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_postfix

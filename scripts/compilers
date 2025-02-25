@@ -1,29 +1,116 @@
-function f_restrictcompilers {
-  echo "[$SCRIPT_COUNT] Restrict compiler access"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
 
-  # shellcheck disable=2046
-  while read -r x; do
-    if [ -f "$x" ] && [ -x "$x" ]; then
-      if ! test -L "$x"; then
-        chmod 0750 "$x"
-
-        if [[ $VERBOSE == "Y" ]]; then
-          echo "$x"
-        fi
-      fi
-    fi
-  done <<< "$(dpkg-query -L $(dpkg -l | grep compil | awk '{print $2}'))"
-
-  ASCOMP="$(command -v as)"
-  # shellcheck disable=2046
-  if [ -f "$ASCOMP" ] && [ -x "$ASCOMP" ]; then
-    chmod 0750 "$(readlink -eq $(command -v as))"
-
-    if [[ $VERBOSE == "Y" ]]; then
-      readlink -eq "$ASCOMP"
-    fi
-  fi
-  echo
-
-  ((SCRIPT_COUNT++))
+# Function to log messages (assumed defined)
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_restrictcompilers {
+    echo "[$SCRIPT_COUNT] Restrict compiler access"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Check and install required packages: dpkg, binutils (for 'as')
+    local required_pkgs=("dpkg" "binutils")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg is not installed, required for compiler restriction"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+    rm -f /tmp/apt_install_error
+
+    # Get list of compiler packages
+    local compilers
+    compilers=$(dpkg -l | grep 'compil' | awk '{print $2}' 2>/tmp/dpkg_error)
+    if [[ $? -ne 0 ]]; then
+        local error_msg=$(cat /tmp/dpkg_error)
+        log_message "ERROR: Failed to query compiler packages - Error: $error_msg"
+        rm -f /tmp/dpkg_error
+        return 1
+    fi
+    rm -f /tmp/dpkg_error
+
+    if [[ -z "$compilers" ]]; then
+        log_message "INFO: No compiler packages found (e.g., gcc, clang). Skipping compiler file restriction"
+    else
+        # Restrict permissions on compiler binaries
+        local restricted=0
+        while IFS= read -r file; do
+            if [[ -f "$file" && -x "$file" && ! -L "$file" ]]; then
+                if chmod 0750 "$file" 2>/tmp/chmod_error; then
+                    log_message "INFO: Restricted permissions to 0750 on $file"
+                    ((restricted++))
+                    [[ "$VERBOSE" == "Y" ]] && echo "$file"
+                else
+                    local error_msg=$(cat /tmp/chmod_error)
+                    log_message "WARNING: Failed to restrict permissions on $file - Error: $error_msg"
+                fi
+            fi
+        done < <(dpkg-query -L $compilers 2>/tmp/dpkg_query_error)
+        
+        if [[ $? -ne 0 ]]; then
+            local error_msg=$(cat /tmp/dpkg_query_error)
+            log_message "ERROR: Failed to list files from compiler packages - Error: $error_msg"
+            rm -f /tmp/dpkg_query_error
+            return 1
+        fi
+        log_message "INFO: Restricted permissions on $restricted compiler binaries"
+        rm -f /tmp/chmod_error /tmp/dpkg_query_error
+    fi
+
+    # Restrict 'as' assembler
+    local ascomp
+    ascomp=$(command -v as)
+    if [[ -z "$ascomp" ]]; then
+        log_message "INFO: 'as' assembler not found, skipping"
+    elif [[ -f "$ascomp" && -x "$ascomp" ]]; then
+        # Resolve symlink to real file
+        local real_ascomp
+        real_ascomp=$(readlink -f "$ascomp" 2>/tmp/readlink_error)
+        if [[ $? -eq 0 ]]; then
+            if chmod 0750 "$real_ascomp" 2>/tmp/chmod_error; then
+                log_message "INFO: Restricted permissions to 0750 on $real_ascomp (via $ascomp)"
+                [[ "$VERBOSE" == "Y" ]] && echo "$real_ascomp"
+            else
+                local error_msg=$(cat /tmp/chmod_error)
+                log_message "WARNING: Failed to restrict permissions on $real_ascomp - Error: $error_msg"
+            fi
+        else
+            local error_msg=$(cat /tmp/readlink_error)
+            log_message "ERROR: Failed to resolve symlink for $ascomp - Error: $error_msg"
+            rm -f /tmp/readlink_error
+            return 1
+        fi
+    else
+        log_message "INFO: 'as' at $ascomp is not a valid executable, skipping"
+    fi
+    rm -f /tmp/chmod_error /tmp/readlink_error
+    echo
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_restrictcompilers

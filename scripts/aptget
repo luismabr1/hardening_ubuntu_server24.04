@@ -1,113 +1,213 @@
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+
+# Function to log messages (assumed defined)
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
 function f_aptget {
-  echo "[$SCRIPT_COUNT] Updating the package index files from their sources"
+    echo "[$SCRIPT_COUNT] Updating the package index files from their sources"
 
-  $APT update
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        return 1
+    fi
 
-  ((SCRIPT_COUNT++))
+    # Update package index
+    if $APT update 2>/tmp/apt_update_error; then
+        log_message "INFO: Successfully updated package index"
+        ((SCRIPT_COUNT++))
+    else
+        local error_msg=$(cat /tmp/apt_update_error)
+        log_message "ERROR: Failed to update package index - Error: $error_msg"
+        rm -f /tmp/apt_update_error
+        return 1
+    fi
+    rm -f /tmp/apt_update_error
 
-  echo "[$SCRIPT_COUNT] Upgrading installed packages"
+    echo "[$SCRIPT_COUNT] Upgrading installed packages"
 
-  $APT -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" --with-new-pkgs upgrade
-
-  ((SCRIPT_COUNT++))
+    # Upgrade packages
+    if $APT -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" --with-new-pkgs upgrade -y 2>/tmp/apt_upgrade_error; then
+        log_message "INFO: Successfully upgraded installed packages"
+        ((SCRIPT_COUNT++))
+    else
+        local error_msg=$(cat /tmp/apt_upgrade_error)
+        log_message "ERROR: Failed to upgrade packages - Error: $error_msg"
+        rm -f /tmp/apt_upgrade_error
+        return 1
+    fi
+    rm -f /tmp/apt_upgrade_error
 }
 
 function f_aptget_clean {
-  echo "[$SCRIPT_COUNT] Removing unused packages"
+    echo "[$SCRIPT_COUNT] Removing unused packages"
 
-  apt-get -qq clean
-  apt-get -qq autoremove
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        return 1
+    fi
 
-  for deb_clean in $(dpkg -l | grep '^rc' | awk '{print $2}'); do
-    $APT purge "$deb_clean"
-  done
+    # Clean APT cache
+    if apt-get -qq clean 2>/tmp/apt_clean_error; then
+        log_message "INFO: Successfully cleaned APT cache"
+    else
+        local error_msg=$(cat /tmp/apt_clean_error)
+        log_message "ERROR: Failed to clean APT cache - Error: $error_msg"
+        return 1
+    fi
 
-  ((SCRIPT_COUNT++))
+    # Autoremove unused packages
+    if apt-get -qq autoremove -y 2>/tmp/apt_autoremove_error; then
+        log_message "INFO: Successfully removed unused packages"
+    else
+        local error_msg=$(cat /tmp/apt_autoremove_error)
+        log_message "ERROR: Failed to autoremove packages - Error: $error_msg"
+        return 1
+    fi
+
+    # Purge residual config packages
+    local purged=0
+    while IFS= read -r deb_clean; do
+        if [[ -n "$deb_clean" ]]; then
+            if $APT purge -y "$deb_clean" 2>/tmp/apt_purge_error; then
+                log_message "INFO: Purged residual package: $deb_clean"
+                ((purged++))
+            else
+                local error_msg=$(cat /tmp/apt_purge_error)
+                log_message "WARNING: Failed to purge $deb_clean - Error: $error_msg"
+            fi
+        fi
+    done < <(dpkg -l | grep '^rc' | awk '{print $2}')
+    log_message "INFO: Purged $purged residual configuration packages"
+    rm -f /tmp/apt_clean_error /tmp/apt_autoremove_error /tmp/apt_purge_error
+
+    ((SCRIPT_COUNT++))
 }
 
 function f_aptget_configure {
-  echo "[$SCRIPT_COUNT] Configure APT"
+    echo "[$SCRIPT_COUNT] Configure APT"
 
-  if ! grep '^Acquire::http::AllowRedirect' /etc/apt/apt.conf.d/* ; then
-    echo 'Acquire::http::AllowRedirect "false";' >> /etc/apt/apt.conf.d/98-hardening-ubuntu
-  else
-    sed -i 's/.*Acquire::http::AllowRedirect.*/Acquire::http::AllowRedirect "false";/g' "$(grep -l 'Acquire::http::AllowRedirect' /etc/apt/apt.conf.d/*)"
-  fi
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        return 1
+    fi
 
-  if ! grep '^APT::Get::AllowUnauthenticated' /etc/apt/apt.conf.d/* ; then
-    echo 'APT::Get::AllowUnauthenticated "false";' >> /etc/apt/apt.conf.d/98-hardening-ubuntu
-  else
-    sed -i 's/.*APT::Get::AllowUnauthenticated.*/APT::Get::AllowUnauthenticated "false";/g' "$(grep -l 'APT::Get::AllowUnauthenticated' /etc/apt/apt.conf.d/*)"
-  fi
+    local apt_conf_dir="/etc/apt/apt.conf.d"
+    mkdir -p "$BACKUP_DIR" "$apt_conf_dir" || {
+        log_message "ERROR: Failed to create directories $BACKUP_DIR or $apt_conf_dir"
+        return 1
+    }
 
-  if ! grep '^APT::Periodic::AutocleanInterval' /etc/apt/apt.conf.d/*; then
-    echo 'APT::Periodic::AutocleanInterval "7";' >> /etc/apt/apt.conf.d/10periodic
-  else
-    sed -i 's/.*APT::Periodic::AutocleanInterval.*/APT::Periodic::AutocleanInterval "7";/g' "$(grep -l 'APT::Periodic::AutocleanInterval' /etc/apt/apt.conf.d/*)"
-  fi
+    # APT configuration settings
+    local settings=(
+        'Acquire::http::AllowRedirect "false" 98-hardening-ubuntu'
+        'APT::Get::AllowUnauthenticated "false" 98-hardening-ubuntu'
+        'APT::Periodic::AutocleanInterval "7" 10periodic'
+        'APT::Install-Recommends "false" 98-hardening-ubuntu'
+        'APT::Get::AutomaticRemove "true" 98-hardening-ubuntu'
+        'APT::Install-Suggests "false" 98-hardening-ubuntu'
+        'Unattended-Upgrade::Remove-Unused-Dependencies "true" 50unattended-upgrades'
+        'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true" 50unattended-upgrades'
+        'Acquire::AllowDowngradeToInsecureRepositories "false" 98-hardening-ubuntu'
+        'Acquire::AllowInsecureRepositories "false" 98-hardening-ubuntu'
+        'APT::Sandbox::Seccomp "1" 98-hardening-ubuntu'
+    )
 
-  if ! grep '^APT::Install-Recommends' /etc/apt/apt.conf.d/*; then
-    echo 'APT::Install-Recommends "false";' >> /etc/apt/apt.conf.d/98-hardening-ubuntu
-  else
-    sed -i 's/.*APT::Install-Recommends.*/APT::Install-Recommends "false";/g' "$(grep -l 'APT::Install-Recommends' /etc/apt/apt.conf.d/*)"
-  fi
+    for setting in "${settings[@]}"; do
+        local key=$(echo "$setting" | cut -d' ' -f1)
+        local value=$(echo "$setting" | cut -d' ' -f2)
+        local file="$apt_conf_dir/$(echo "$setting" | cut -d' ' -f3)"
 
-  if ! grep '^APT::Get::AutomaticRemove' /etc/apt/apt.conf.d/*; then
-    echo 'APT::Get::AutomaticRemove "true";' >> /etc/apt/apt.conf.d/98-hardening-ubuntu
-  else
-    sed -i 's/.*APT::Get::AutomaticRemove.*/APT::Get::AutomaticRemove "true";/g' "$(grep -l 'APT::Get::AutomaticRemove' /etc/apt/apt.conf.d/*)"
-  fi
+        # Backup existing file
+        [[ -f "$file" ]] && cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" && \
+            log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
 
-  if ! grep '^APT::Install-Suggests' /etc/apt/apt.conf.d/*; then
-    echo 'APT::Install-Suggests "false";' >> /etc/apt/apt.conf.d/98-hardening-ubuntu
-  else
-    sed -i 's/.*APT::Install-Suggests.*/APT::Install-Suggests "false";/g' "$(grep -l 'APT::Install-Suggests' /etc/apt/apt.conf.d/*)"
-  fi
+        if ! grep -r "^${key}" "$apt_conf_dir"/* >/dev/null 2>&1; then
+            if echo "${key} ${value};" >> "$file" 2>/tmp/apt_conf_error; then
+                chmod 0644 "$file"
+                log_message "INFO: Added $key to $file"
+            else
+                local error_msg=$(cat /tmp/apt_conf_error)
+                log_message "ERROR: Failed to add $key to $file - Error: $error_msg"
+                rm -f /tmp/apt_conf_error
+                return 1
+            fi
+        else
+            local target_file=$(grep -l "^${key}" "$apt_conf_dir"/*)
+            if sed -i "s|.*${key}.*|${key} ${value};|g" "$target_file" 2>/tmp/sed_error; then
+                log_message "INFO: Updated $key in $target_file"
+            else
+                local error_msg=$(cat /tmp/sed_error)
+                log_message "ERROR: Failed to update $key in $target_file - Error: $error_msg"
+                rm -f /tmp/sed_error
+                return 1
+            fi
+        fi
+    done
+    rm -f /tmp/apt_conf_error /tmp/sed_error
 
-  if ! grep '^Unattended-Upgrade::Remove-Unused-Dependencies' /etc/apt/apt.conf.d/*; then
-    echo 'Unattended-Upgrade::Remove-Unused-Dependencies "true";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-  else
-    sed -i 's/.*Unattended-Upgrade::Remove-Unused-Dependencies.*/Unattended-Upgrade::Remove-Unused-Dependencies "true";/g' "$(grep -l 'Unattended-Upgrade::Remove-Unused-Dependencies' /etc/apt/apt.conf.d/*)"
-  fi
-
-  if ! grep '^Unattended-Upgrade::Remove-Unused-Kernel-Packages' /etc/apt/apt.conf.d/*; then
-    echo 'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-  else
-    sed -i 's/.*Unattended-Upgrade::Remove-Unused-Kernel-Packages.*/Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";/g' "$(grep -l 'Unattended-Upgrade::Remove-Unused-Kernel-Packages' /etc/apt/apt.conf.d/*)"
-  fi
-
-  if ! grep '^Acquire::AllowDowngradeToInsecureRepositories' /etc/apt/apt.conf.d/*; then
-    echo 'Acquire::AllowDowngradeToInsecureRepositories "false";' >> /etc/apt/apt.conf.d/98-hardening-ubuntu
-  else
-    sed -i 's/.*Acquire::AllowDowngradeToInsecureRepositories.*/Acquire::AllowDowngradeToInsecureRepositories "false";/g' "$(grep -l 'Acquire::AllowDowngradeToInsecureRepositories' /etc/apt/apt.conf.d/*)"
-  fi
-
-  if ! grep '^Acquire::AllowInsecureRepositories' /etc/apt/apt.conf.d/*; then
-    echo 'Acquire::AllowInsecureRepositories "false";' >> /etc/apt/apt.conf.d/98-hardening-ubuntu
-  else
-    sed -i 's/.*Acquire::AllowInsecureRepositories.*/Acquire::AllowInsecureRepositories "false";/g' "$(grep -l 'Acquire::AllowInsecureRepositories' /etc/apt/apt.conf.d/*)"
-  fi
-
-  if ! grep '^APT::Sandbox::Seccomp' /etc/apt/apt.conf.d/*; then
-    echo 'APT::Sandbox::Seccomp "1";' >> /etc/apt/apt.conf.d/98-hardening-ubuntu
-  else
-    sed -i 's/.*APT::Sandbox::Seccomp.*/APT::Sandbox::Seccomp "1";/g' "$(grep -l 'APT::Sandbox::Seccomp' /etc/apt/apt.conf.d/*)"
-  fi
-
-  ((SCRIPT_COUNT++))
+    ((SCRIPT_COUNT++))
 }
 
 function f_aptget_noexec {
-  if [[ $LXC == "1" ]]; then
-    return
-  fi
+    if [[ "$LXC" == "1" ]]; then
+        log_message "INFO: Skipping DPkg noexec configuration in LXC environment"
+        return 0
+    fi
 
-  echo "[$SCRIPT_COUNT] Configure DPkg noexec"
+    echo "[$SCRIPT_COUNT] Configure DPkg noexec"
 
-  if ! grep 'mount.* /tmp' /etc/apt/apt.conf.d/* ; then
-    echo 'DPkg::Pre-Invoke {"mount -o remount,exec,nodev,nosuid /tmp";};' >> /etc/apt/apt.conf.d/99noexec-tmp
-    echo 'DPkg::Post-Invoke {"mount -o remount,mode=1777,strictatime,noexec,nodev,nosuid /tmp";};' >> /etc/apt/apt.conf.d/99noexec-tmp
-  fi
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        return 1
+    fi
 
-  ((SCRIPT_COUNT++))
+    local noexec_file="/etc/apt/apt.conf.d/99noexec-tmp"
+    mkdir -p "$BACKUP_DIR" "/etc/apt/apt.conf.d" || {
+        log_message "ERROR: Failed to create directories $BACKUP_DIR or /etc/apt/apt.conf.d"
+        return 1
+    }
+
+    # Backup if file exists
+    [[ -f "$noexec_file" ]] && cp "$noexec_file" "$BACKUP_DIR/99noexec-tmp.$TIMESTAMP" && \
+        log_message "INFO: Backed up $noexec_file to $BACKUP_DIR/99noexec-tmp.$TIMESTAMP"
+
+    if ! grep -r 'mount.* /tmp' /etc/apt/apt.conf.d/* >/dev/null 2>&1; then
+        {
+            echo 'DPkg::Pre-Invoke {"mount -o remount,exec,nodev,nosuid /tmp";};' && \
+            echo 'DPkg::Post-Invoke {"mount -o remount,mode=1777,strictatime,noexec,nodev,nosuid /tmp";};'
+        } > "$noexec_file" 2>/tmp/noexec_error
+        if [[ $? -eq 0 ]]; then
+            chmod 0644 "$noexec_file"
+            log_message "INFO: Configured DPKG noexec for /tmp in $noexec_file"
+        else
+            local error_msg=$(cat /tmp/noexec_error)
+            log_message "ERROR: Failed to configure DPKG noexec in $noexec_file - Error: $error_msg"
+            rm -f /tmp/noexec_error
+            return 1
+        fi
+    else
+        log_message "INFO: DPKG noexec configuration already present"
+    fi
+    rm -f /tmp/noexec_error
+
+    ((SCRIPT_COUNT++))
 }
+
+# Example usage (assuming part of larger script)
+# f_aptget
+# f_aptget_clean
+# f_aptget_configure
+# f_aptget_noexec

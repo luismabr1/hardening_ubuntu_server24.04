@@ -1,59 +1,164 @@
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# KEEP_SNAPD='N'  # Default to not keeping snapd
+# LXC='0'          # Default to not running in LXC
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
 function f_package_install {
-  echo "[$SCRIPT_COUNT] Installing base packages"
+    echo "[$SCRIPT_COUNT] Installing base packages for security and functionality"
 
-  local APPARMOR
-  local AUDITD
-  local VM
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
 
-  if [[ "${KEEP_SNAPD}" == "Y" ]]; then
-    apt-mark hold snapd
-  fi
+    # Ensure apt is available (coreutils for dmesg, debconf-utils for debconf-set-selections)
+    local required_pkgs=("apt" "coreutils" "debconf-utils")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg not found, required for package management"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
 
-  APPARMOR="apparmor-profiles apparmor-utils libpam-apparmor"
-  AUDITD="auditd audispd-plugins"
-  VM=""
+    # Hold snapd if KEEP_SNAPD=Y
+    if [[ "${KEEP_SNAPD}" == "Y" ]]; then
+        if apt-mark hold snapd 2>/tmp/hold_error; then
+            log_message "INFO: Held snapd package to prevent removal"
+        else
+            local error_msg=$(cat /tmp/hold_error)
+            log_message "ERROR: Failed to hold snapd - Error: $error_msg"
+            rm -f /tmp/hold_error
+            return 1
+        fi
+    fi
 
-  if dmesg | grep -i -E "dmi.*vmware"; then
-    VM="open-vm-tools"
-  fi
+    # Define package groups
+    local APPARMOR="apparmor-profiles apparmor-utils libpam-apparmor"
+    local AUDITD="auditd audispd-plugins"
+    local VM=""
 
-  if dmesg | grep -i -E "dmi.*virtualbox"; then
-    VM="virtualbox-guest-dkms virtualbox-guest-utils"
-  fi
+    if dmesg | grep -i -E "dmi.*vmware" >/dev/null 2>&1; then
+        VM="open-vm-tools"
+        log_message "INFO: Detected VMware environment, adding open-vm-tools"
+    fi
+    if dmesg | grep -i -E "dmi.*virtualbox" >/dev/null 2>&1; then
+        VM="virtualbox-guest-dkms virtualbox-guest-utils"
+        log_message "INFO: Detected VirtualBox environment, adding virtualbox-guest packages"
+    fi
+    if [[ "$LXC" == "1" ]]; then
+        APPARMOR=""
+        AUDITD=""
+        log_message "INFO: Running in LXC, skipping AppArmor and Auditd packages"
+    fi
 
-  if [[ $LXC == "1" ]]; then
-    APPARMOR=""
-    AUDITD=""
-  fi
+    # Configure postfix non-interactively
+    if echo "postfix postfix/main_mailer_type select Internet Site" | debconf-set-selections 2>/tmp/debconf_error && \
+       echo "postfix postfix/mailname string $(hostname -f)" | debconf-set-selections 2>/tmp/debconf_error; then
+        log_message "INFO: Configured postfix debconf settings"
+    else
+        local error_msg=$(cat /tmp/debconf_error)
+        log_message "ERROR: Failed to set postfix debconf selections - Error: $error_msg"
+        rm -f /tmp/debconf_error
+        return 1
+    fi
 
-  echo "postfix postfix/main_mailer_type select Internet Site" | debconf-set-selections
-  echo "postfix postfix/mailname string $(hostname -f)" | debconf-set-selections
+    # Define base packages (CIS 2.2)
+    local PACKAGE_INSTALL="acct aide-common cracklib-runtime debsums gnupg2 haveged libpam-pwquality libpam-tmpdir needrestart openssh-server postfix psad rkhunter sysstat systemd-coredump tcpd update-notifier-common vlock $APPARMOR $AUDITD $VM"
+    local installed_count=0
+    for deb_install in $PACKAGE_INSTALL; do
+        if $APT install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confnew --no-install-recommends "$deb_install" 2>/tmp/install_error; then
+            log_message "INFO: Successfully installed package $deb_install"
+            ((installed_count++))
+        else
+            local error_msg=$(cat /tmp/install_error)
+            log_message "WARNING: Failed to install package $deb_install - Error: $error_msg"
+            # Continue to next package, non-critical unless all fail
+        fi
+    done
+    log_message "INFO: Installed $installed_count base packages"
 
-  local PACKAGE_INSTALL
+    # Configure sysstat
+    local sysstat_conf="/etc/default/sysstat"
+    if [[ -f "$sysstat_conf" ]]; then
+        if sed -i 's|^[#]*ENABLED=.*|ENABLED="true"|' "$sysstat_conf" 2>/tmp/sed_error; then
+            log_message "INFO: Enabled sysstat in $sysstat_conf"
+            if systemctl enable sysstat 2>/tmp/sysstat_error; then
+                log_message "INFO: Enabled sysstat service"
+            else
+                local error_msg=$(cat /tmp/sysstat_error)
+                log_message "ERROR: Failed to enable sysstat service - Error: $error_msg"
+                rm -f /tmp/sysstat_error
+                return 1
+            fi
+        else
+            local error_msg=$(cat /tmp/sed_error)
+            log_message "ERROR: Failed to enable sysstat in $sysstat_conf - Error: $error_msg"
+            rm -f /tmp/sed_error
+            return 1
+        fi
+    else
+        log_message "WARNING: $sysstat_conf not found, skipping sysstat configuration"
+    fi
+    rm -f /tmp/install_error /tmp/debconf_error /tmp/hold_error /tmp/sed_error /tmp/sysstat_error /tmp/apt_install_error
 
-  PACKAGE_INSTALL="acct aide-common cracklib-runtime debsums gnupg2 haveged libpam-pwquality libpam-tmpdir needrestart openssh-server postfix psad rkhunter sysstat systemd-coredump tcpd update-notifier-common vlock $APPARMOR $AUDITD $VM"
-
-  for deb_install in $PACKAGE_INSTALL; do
-    $APT install -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confnew --no-install-recommends "$deb_install"
-  done
-
-  if [[ -f /etc/default/sysstat ]]; then
-    sed -i 's/ENABLED=.*/ENABLED="true"/' /etc/default/sysstat
-    systemctl enable sysstat
-  fi
-
-  ((SCRIPT_COUNT++))
+    ((SCRIPT_COUNT++))
 }
 
 function f_package_remove {
-  echo "[$SCRIPT_COUNT] Package removal"
+    echo "[$SCRIPT_COUNT] Removing unnecessary or insecure packages"
 
-  local PACKAGE_REMOVE
-  PACKAGE_REMOVE="apport* autofs avahi* beep git pastebinit popularity-contest rsh* rsync talk* telnet* tftp* whoopsie xinetd yp-tools ypbind"
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
 
-  for deb_remove in $PACKAGE_REMOVE; do
-    $APT purge "$deb_remove"
-  done
+    # Define packages to remove (CIS 2.2, NIST CM-7)
+    local PACKAGE_REMOVE="apport* autofs avahi* beep git pastebinit popularity-contest rsh* rsync talk* telnet* tftp* whoopsie xinetd yp-tools ypbind"
+    local removed_count=0
+    for deb_remove in $PACKAGE_REMOVE; do
+        if $APT purge -y "$deb_remove" 2>/tmp/purge_error; then
+            log_message "INFO: Successfully purged package $deb_remove"
+            ((removed_count++))
+        else
+            local error_msg=$(cat /tmp/purge_error)
+            # Check if package wasn't installed (non-critical)
+            if echo "$error_msg" | grep -q "not installed"; then
+                log_message "INFO: Package $deb_remove not installed, skipping"
+            else
+                log_message "WARNING: Failed to purge package $deb_remove - Error: $error_msg"
+            fi
+        fi
+    done
+    log_message "INFO: Removed or skipped $removed_count packages"
+    rm -f /tmp/purge_error
 
-  ((SCRIPT_COUNT++))
+    ((SCRIPT_COUNT++))
 }
+
+# Example usage (assuming part of larger script)
+# f_package_install
+# f_package_remove

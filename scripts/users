@@ -1,18 +1,148 @@
-function f_users {
-  echo "[$SCRIPT_COUNT] Remove users"
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+# HOSTS_EQUIV='/etc/hosts.equiv'
+# SECURETTY='/etc/securetty'
+# DEBUG_SHELL_SERVICE='debug-shell.service'
+# SSH_MODULI='/etc/ssh/moduli'
+# SSH_SERVICE='ssh.service'
+# SUDOERS_DIR='/etc/sudoers.d'
+# PAM_SU='/etc/pam.d/su'
+# SUDO_LOG='/var/log/sudo.log'
+# SUID_LIST='./misc/suid.list'
+# SHELLS_FILE='/etc/shells'
+# SYSCTL_SERVICE='systemd-sysctl.service'
+# ARPBIN='/usr/sbin/arp'
+# PINGBIN='/bin/ping'
+# DIGBIN='/usr/bin/dig'
+# TIMESYNCD_SERVICE='systemd-timesyncd.service'
+# UFW_SERVICE='ufw.service'
+# RC_INIT='/etc/init.d/rc'
+# PROFILE='/etc/profile'
+# BASHRC='/etc/bash.bashrc'
+# PROFILE_D='/etc/profile.d'
+# AUTOLOGOUT_SH='/etc/profile.d/autologout.sh'
+# USBGUARD_CONF='/etc/usbguard/rules.conf'
+# USBGUARD_SERVICE='usbguard.service'
 
-  for user in games gnats irc list news sync uucp; do
-    if id "$user" &>/dev/null; then
-      pkill -u "$user"
-      if userdel -r "$user" &>/dev/null; then
-        echo "User $user deleted successfully."
-      else
-        echo "Failed to delete user $user."
-      fi
-    else
-      echo "User $user does not exist."
-    fi
-  done
+# New variables to add to global variables file:
+# PASSWD_FILE='/etc/passwd'  # Path to passwd file for user verification
+# SHADOW_FILE='/etc/shadow'  # Path to shadow file for user password backup
 
-  ((SCRIPT_COUNT++))
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_users {
+    echo "[$SCRIPT_COUNT] Removing unnecessary system users"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure required packages are installed (coreutils for id, passwd for userdel/pkill)
+    local required_pkgs=("coreutils" "passwd")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg not found, required for user management"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+
+    # Backup /etc/passwd and /etc/shadow
+    local passwd_file="/etc/passwd"   # Using PASSWD_FILE if defined
+    local shadow_file="/etc/shadow"   # Using SHADOW_FILE if defined
+    local files=("$passwd_file" "$shadow_file")
+    mkdir -p "$BACKUP_DIR" || {
+        log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
+        return 1
+    }
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]]; then
+            if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+            else
+                local error_msg=$(cat /tmp/cp_error)
+                log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                rm -f /tmp/cp_error
+                return 1
+            fi
+        else
+            log_message "ERROR: $file not found, cannot proceed with user removal"
+            return 1
+        fi
+    done
+
+    # List of users to remove (CIS 6.2.1)
+    local users_to_remove=("games" "gnats" "irc" "list" "news" "sync" "uucp")
+    local removed_count=0
+    for user in "${users_to_remove[@]}"; do
+        if id "$user" &>/dev/null; then
+            log_message "INFO: User $user exists, proceeding with removal"
+            if pkill -u "$user" 2>/tmp/pkill_error; then
+                log_message "INFO: Terminated processes for user $user"
+            else
+                local error_msg=$(cat /tmp/pkill_error 2>/dev/null || echo "No processes found")
+                log_message "WARNING: Failed to terminate processes for $user - Ignoring: $error_msg"
+            fi
+            if userdel -r "$user" 2>/tmp/userdel_error; then
+                log_message "INFO: Successfully deleted user $user along with home directory"
+                echo "User $user deleted successfully."
+                ((removed_count++))
+            else
+                local error_msg=$(cat /tmp/userdel_error)
+                log_message "ERROR: Failed to delete user $user - Error: $error_msg"
+                echo "Failed to delete user $user."
+                rm -f /tmp/userdel_error
+                return 1
+            fi
+        else
+            log_message "INFO: User $user does not exist, skipping"
+            echo "User $user does not exist."
+        fi
+    done
+    log_message "INFO: Processed $removed_count users for removal"
+
+    # Verify user removal
+    local verified=true
+    for user in "${users_to_remove[@]}"; do
+        if id "$user" &>/dev/null; then
+            log_message "WARNING: User $user still exists after attempted removal"
+            verified=false
+        fi
+    done
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified all specified users have been removed"
+    fi
+    rm -f /tmp/pkill_error /tmp/userdel_error /tmp/cp_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_users

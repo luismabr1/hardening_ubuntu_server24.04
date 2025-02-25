@@ -1,18 +1,131 @@
-function f_post {
-  if [[ $LXC == "1" ]]; then
-    return
-  fi
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
 
-  echo "[$SCRIPT_COUNT] Post processing"
+# New variable to add to global variables file:
+# SECUREBOOT_DB='/usr/share/secureboot/db'  # Path to Secure Boot database, added for potential future use or verification
 
-  $APT install --no-install-recommends fwupd secureboot-db
-
-  if [[ $VERBOSE == "Y" ]]; then
-    update-grub
-    ((SCRIPT_COUNT++))
-  else
-    update-grub 2>/dev/null
-  fi
-
-  find /boot/ -type f -name '*.cfg' -exec chmod 0400 {} \;
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_post {
+    # Skip if running in LXC environment
+    if [[ "$LXC" == "1" ]]; then
+        log_message "INFO: Skipping post-processing in LXC environment"
+        return 0
+    fi
+
+    echo "[$SCRIPT_COUNT] Post-processing tasks for firmware and bootloader security"
+
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "This function must be run as root" >&2
+        log_message "ERROR: Function must be run as root"
+        return 1
+    fi
+
+    # Ensure required packages are installed (apt, grub2-common for update-grub)
+    local required_pkgs=("apt" "grub2-common")
+    for pkg in "${required_pkgs[@]}"; do
+        if ! dpkg -l | grep -q "^ii.*$pkg"; then
+            log_message "WARNING: Package $pkg not found, required for post-processing"
+            log_message "INFO: Attempting to install $pkg"
+            if $APT install -y "$pkg" 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed $pkg"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install $pkg - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: Package $pkg is already installed"
+        fi
+    done
+
+    # Install fwupd and secureboot-db (CIS 1.3.1)
+    local packages="fwupd secureboot-db"
+    local installed_count=0
+    for pkg in $packages; do
+        if $APT install -y --no-install-recommends "$pkg" 2>/tmp/install_error; then
+            log_message "INFO: Successfully installed package $pkg"
+            ((installed_count++))
+        else
+            local error_msg=$(cat /tmp/install_error)
+            log_message "ERROR: Failed to install package $pkg - Error: $error_msg"
+            rm -f /tmp/install_error
+            return 1
+        fi
+    done
+    log_message "INFO: Installed $installed_count firmware and Secure Boot packages"
+
+    # Update GRUB configuration
+    if [[ "$VERBOSE" == "Y" ]]; then
+        if update-grub 2>/tmp/grub_error; then
+            log_message "INFO: Successfully updated GRUB configuration (verbose mode)"
+            ((SCRIPT_COUNT++))
+        else
+            local error_msg=$(cat /tmp/grub_error)
+            log_message "ERROR: Failed to update GRUB (verbose mode) - Error: $error_msg"
+            rm -f /tmp/grub_error
+            return 1
+        fi
+    else
+        if update-grub 2>/tmp/grub_error >/dev/null; then
+            log_message "INFO: Successfully updated GRUB configuration (silent mode)"
+        else
+            local error_msg=$(cat /tmp/grub_error)
+            log_message "ERROR: Failed to update GRUB (silent mode) - Error: $error_msg"
+            rm -f /tmp/grub_error
+            return 1
+        fi
+    fi
+
+    # Secure GRUB configuration files in /boot/ (CIS 1.3.1)
+    local boot_files
+    boot_files=$(find /boot/ -type f -name '*.cfg' 2>/tmp/find_error)
+    if [[ $? -eq 0 ]]; then
+        if [[ -n "$boot_files" ]]; then
+            local secured_count=0
+            while IFS= read -r file; do
+                if chmod 0400 "$file" 2>/tmp/chmod_error; then
+                    log_message "INFO: Secured permissions to 0400 on $file"
+                    ((secured_count++))
+                else
+                    local error_msg=$(cat /tmp/chmod_error)
+                    log_message "ERROR: Failed to secure permissions on $file - Error: $error_msg"
+                    rm -f /tmp/chmod_error
+                    return 1
+                fi
+            done <<< "$boot_files"
+            log_message "INFO: Secured $secured_count GRUB configuration files in /boot/"
+        else
+            log_message "INFO: No GRUB configuration files (*.cfg) found in /boot/ to secure"
+        fi
+    else
+        local error_msg=$(cat /tmp/find_error)
+        log_message "ERROR: Failed to find GRUB configuration files in /boot/ - Error: $error_msg"
+        rm -f /tmp/find_error
+        return 1
+    fi
+
+    # Verify GRUB permissions (example verification, assumes at least one .cfg file)
+    if find /boot/ -type f -name '*.cfg' -perm 0400 | grep -q '.' 2>/dev/null; then
+        log_message "INFO: Verified GRUB configuration files in /boot/ have 0400 permissions"
+    else
+        log_message "WARNING: Some GRUB configuration files in /boot/ do not have 0400 permissions"
+    fi
+    rm -f /tmp/install_error /tmp/grub_error /tmp/chmod_error /tmp/find_error /tmp/apt_install_error
+
+    ((SCRIPT_COUNT++))
+}
+
+# Example usage (assuming part of larger script)
+# f_post

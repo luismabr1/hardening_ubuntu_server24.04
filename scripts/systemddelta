@@ -1,8 +1,89 @@
-function f_systemddelta {
-  if [[ $VERBOSE == "Y" ]]; then
-    echo "[$SCRIPT_COUNT] Show systemd-delta"
-    systemd-delta --no-pager
-    ((SCRIPT_COUNT++))
-    echo
-  fi
+# Assuming part of a larger script with these variables:
+# LOG_FILE="/var/log/user_hardening.log"
+# BACKUP_DIR="/root/backups"
+# TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# VERBOSE='N'
+# SCRIPT_COUNT=0
+# APT='apt-get'
+# LXC='0'
+# SECUREBOOT_DB='/usr/share/secureboot/db'
+# POSTFIX_CONF='/etc/postfix/main.cf'
+# LSB_RELEASE='/usr/bin/lsb_release'
+# PSAD_SERVICE='psad.service'
+# REBOOT_REQUIRED='/var/run/reboot-required'
+# NSSWITCH_CONF='/etc/nsswitch.conf'
+# HOSTS_EQUIV='/etc/hosts.equiv'
+# SECURETTY='/etc/securetty'
+# DEBUG_SHELL_SERVICE='debug-shell.service'
+# SSH_MODULI='/etc/ssh/moduli'
+# SSH_SERVICE='ssh.service'
+# SUDOERS_DIR='/etc/sudoers.d'
+# PAM_SU='/etc/pam.d/su'
+# SUDO_LOG='/var/log/sudo.log'
+# SUID_LIST='./misc/suid.list'
+# SHELLS_FILE='/etc/shells'
+# SYSCTL_SERVICE='systemd-sysctl.service'
+# ARPBIN='/usr/sbin/arp'
+
+# New variables to add to global variables file:
+# None required; this script uses existing variables and no new persistent configuration
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
+
+function f_systemddelta {
+    # Only proceed if verbose mode is enabled
+    if [[ "$VERBOSE" == "Y" ]]; then
+        echo "[$SCRIPT_COUNT] Showing systemd-delta for unit overrides"
+
+        # Check if running as root (recommended for full systemd access, but not strictly required)
+        if [[ $EUID -ne 0 ]]; then
+            log_message "WARNING: Function should be run as root for full systemd access, proceeding with limited privileges"
+        else
+            log_message "INFO: Confirmed running as root"
+        fi
+
+        # Ensure systemd is installed (for systemd-delta)
+        if ! dpkg -l | grep -q "^ii.*systemd"; then
+            log_message "WARNING: systemd package not found, required for systemd-delta"
+            log_message "INFO: Attempting to install systemd"
+            if $APT install -y systemd 2>/tmp/apt_install_error; then
+                log_message "INFO: Successfully installed systemd"
+            else
+                local error_msg=$(cat /tmp/apt_install_error)
+                log_message "ERROR: Failed to install systemd - Error: $error_msg"
+                rm -f /tmp/apt_install_error
+                return 1
+            fi
+        else
+            log_message "INFO: systemd package is already installed"
+        fi
+
+        # Run systemd-delta and capture output
+        local delta_output
+        delta_output=$(systemd-delta --no-pager 2>/tmp/delta_error)
+        if [[ $? -eq 0 ]]; then
+            log_message "INFO: Successfully executed systemd-delta; output captured"
+            echo "$delta_output"
+        else
+            local error_msg=$(cat /tmp/delta_error)
+            log_message "ERROR: Failed to execute systemd-delta - Error: $error_msg"
+            rm -f /tmp/delta_error
+            return 1
+        fi
+
+        # Increment SCRIPT_COUNT for consistency with original
+        ((SCRIPT_COUNT++))
+        log_message "INFO: SCRIPT_COUNT incremented to $SCRIPT_COUNT"
+
+        echo
+    else
+        log_message "INFO: Skipping systemd-delta execution as VERBOSE is not 'Y'"
+    fi
+    rm -f /tmp/delta_error /tmp/apt_install_error
+}
+
+# Example usage (assuming part of larger script)
+# f_systemddelta
