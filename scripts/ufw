@@ -29,7 +29,7 @@
 # TIMESYNCD_SERVICE='systemd-timesyncd.service'
 # UFWDEFAULT='/etc/default/ufw'
 # FW_ADMIN='127.0.0.1'
-# SSH_PORT='22'
+# SSH_PORT='2123'  # CHANGED: Updated to match ubuntu.cfg and log
 
 # New variables to add to global variables file:
 # UFW_SERVICE='ufw.service'  # Defines UFW service name for consistency
@@ -125,8 +125,9 @@ function f_firewall {
         fi
     done
 
-    # Enable UFW logging
+    # Enable UFW logging with delay for consistency
     if ufw logging on 2>/tmp/ufw_error; then
+        sleep 2  # CHANGED: Added delay to ensure logging takes effect
         log_message "INFO: Enabled UFW logging"
     else
         local error_msg=$(cat /tmp/ufw_error)
@@ -160,9 +161,18 @@ function f_firewall {
     done
     log_message "INFO: Configured $admin_count admin IPs for SSH access"
 
-    # Enable UFW with force
+    # Enable UFW with force and ensure service is active
     if ufw --force enable 2>/tmp/ufw_error; then
         log_message "INFO: Successfully enabled UFW with force"
+        # CHANGED: Added service restart to ensure active state
+        if systemctl restart "$UFW_SERVICE" 2>/tmp/service_error; then
+            log_message "INFO: Restarted $UFW_SERVICE to ensure active state"
+        else
+            local error_msg=$(cat /tmp/service_error)
+            log_message "ERROR: Failed to restart $UFW_SERVICE - Error: $error_msg"
+            rm -f /tmp/service_error
+            return 1
+        fi
     else
         local error_msg=$(cat /tmp/ufw_error)
         log_message "ERROR: Failed to enable UFW - Error: $error_msg"
@@ -172,10 +182,10 @@ function f_firewall {
 
     # Verify UFW configuration
     local verified=true
-    if ufw status | grep -q "Status: active"; then
-        log_message "INFO: Verified UFW is active"
+    if systemctl is-active "$UFW_SERVICE" >/dev/null 2>&1; then
+        log_message "INFO: Verified $UFW_SERVICE is active"
     else
-        log_message "WARNING: UFW is not active after enabling"
+        log_message "WARNING: $UFW_SERVICE is not active after enabling"
         verified=false
     fi
     if ufw status | grep -q "logging: on"; then
@@ -196,11 +206,11 @@ function f_firewall {
 
     # Show status if verbose
     if [[ "$VERBOSE" == "Y" ]]; then
-        systemctl status ufw.service --no-pager
+        systemctl status "$UFW_SERVICE" --no-pager
         ufw status verbose
         echo
     fi
-    rm -f /tmp/sed_error /tmp/ufw_error /tmp/cp_error /tmp/apt_install_error
+    rm -f /tmp/sed_error /tmp/ufw_error /tmp/cp_error /tmp/apt_install_error /tmp/service_error
 
     ((SCRIPT_COUNT++))
 }

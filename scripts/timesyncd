@@ -26,7 +26,7 @@
 # ARPBIN='/usr/sbin/arp'
 # TIMESYNCD='/etc/systemd/timesyncd.conf'
 # NTPSERVERPOOL='0.ubuntu.pool.ntp.org 1.ubuntu.pool.ntp.org 2.ubuntu.pool.ntp.org 3.ubuntu.pool.ntp.org pool.ntp.org'
-# TIMEDATECTL=''
+# TIMEDATECTL='America/Caracas'  # CHANGED: Updated to apply timezone
 
 # New variables to add to global variables file:
 # PINGBIN='/bin/ping'              # Path to ping binary, used for latency checks
@@ -192,11 +192,11 @@ function f_timesyncd {
     if [[ "$APPLY" == "YES" ]]; then
         if cat "$TMPCONF" > "$TIMESYNCD" 2>/tmp/cat_error; then
             log_message "INFO: Applied temporary config from $TMPCONF to $TIMESYNCD"
-            if systemctl restart systemd-timesyncd.service 2>/tmp/timesyncd_restart_error; then
-                log_message "INFO: Successfully restarted systemd-timesyncd.service"
+            if systemctl restart "$TIMESYNCD_SERVICE" 2>/tmp/timesyncd_restart_error; then  # CHANGED: Use variable for consistency
+                log_message "INFO: Successfully restarted $TIMESYNCD_SERVICE"
             else
                 local error_msg=$(cat /tmp/timesyncd_restart_error)
-                log_message "ERROR: Failed to restart systemd-timesyncd.service - Error: $error_msg"
+                log_message "ERROR: Failed to restart $TIMESYNCD_SERVICE - Error: $error_msg"
                 rm -f /tmp/timesyncd_restart_error "$TMPCONF"
                 return 1
             fi
@@ -221,6 +221,7 @@ function f_timesyncd {
     if [[ -n "$TIMEDATECTL" ]]; then
         if timedatectl set-timezone "$TIMEDATECTL" 2>/tmp/timedatectl_error; then
             log_message "INFO: Set timezone to $TIMEDATECTL"
+            sleep 1  # CHANGED: Added brief delay to ensure timezone change propagates
         else
             local error_msg=$(cat /tmp/timedatectl_error)
             log_message "ERROR: Failed to set timezone to $TIMEDATECTL - Error: $error_msg"
@@ -243,10 +244,10 @@ function f_timesyncd {
                 verified=false
             fi
         done
-        if systemctl is-active systemd-timesyncd.service >/dev/null 2>&1; then
-            log_message "INFO: Verified systemd-timesyncd.service is active"
+        if systemctl is-active "$TIMESYNCD_SERVICE" >/dev/null 2>&1; then  # CHANGED: Use variable for consistency
+            log_message "INFO: Verified $TIMESYNCD_SERVICE is active"
         else
-            log_message "WARNING: systemd-timesyncd.service is not active after restart"
+            log_message "WARNING: $TIMESYNCD_SERVICE is not active after restart"
             verified=false
         fi
         if [[ "$verified" == "true" ]]; then
@@ -258,12 +259,13 @@ function f_timesyncd {
             log_message "INFO: Verified timezone is set to $TIMEDATECTL"
         else
             log_message "WARNING: Timezone not set to $TIMEDATECTL as expected"
+            verified=false
         fi
     fi
 
     # Show status if verbose
     if [[ "$VERBOSE" == "Y" ]]; then
-        systemctl status systemd-timesyncd.service --no-pager
+        systemctl status "$TIMESYNCD_SERVICE" --no-pager  # CHANGED: Use variable for consistency
         echo
         timedatectl
         echo
