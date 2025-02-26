@@ -104,12 +104,14 @@ function f_suid {
                         local octal_perms
                         octal_perms=$(stat -c "%a" "$file" 2>/tmp/stat_error | sed 's/^0*//')
                         if [[ $? -eq 0 ]]; then
-                            local ug
-                            ug=$(stat -c "%U %G" "$file" 2>/tmp/stat_error)
+                            # CHANGED: Split ug into user and group to fix dpkg-statoverride syntax
+                            local user group
+                            user=$(stat -c "%U" "$file" 2>/tmp/stat_error)
+                            group=$(stat -c "%G" "$file" 2>/tmp/stat_error)
                             if [[ $? -eq 0 ]]; then
                                 dpkg-statoverride --remove "$file" 2>/dev/null || true  # Remove existing override silently
-                                if dpkg-statoverride --add "$ug" "$octal_perms" "$file" 2>/tmp/statoverride_error; then
-                                    log_message "INFO: Added dpkg-statoverride for $file with permissions $octal_perms and ownership $ug"
+                                if dpkg-statoverride --add "$user" "$group" "$octal_perms" "$file" 2>/tmp/statoverride_error; then
+                                    log_message "INFO: Added dpkg-statoverride for $file with permissions $octal_perms and ownership $user:$group"
                                     ((suid_removed_count++))
                                 else
                                     local error_msg=$(cat /tmp/statoverride_error)

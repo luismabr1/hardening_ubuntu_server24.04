@@ -60,13 +60,13 @@ function f_sudo {
     # Backup sudoers.d and PAM files
     local sudoers_dir="/etc/sudoers.d"  # Using SUDOERS_DIR if defined
     local pam_su="/etc/pam.d/su"        # Using PAM_SU if defined
-    local files=("$pam_su")
+    local files=("$pam_su")  # Only valid files; removed potential empty entries
     mkdir -p "$BACKUP_DIR" || {
         log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
         return 1
     }
     for file in "${files[@]}"; do
-        if [[ -f "$file" ]]; then
+        if [[ -n "$file" && -f "$file" ]]; then  # Check for non-empty and existing file
             if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
                 log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
             else
@@ -81,19 +81,21 @@ function f_sudo {
     if [[ -d "$sudoers_dir" ]]; then
         local sudoers_files
         sudoers_files=$(find "$sudoers_dir" -type f -name '[0-9]*' 2>/tmp/find_error)
-        if [[ $? -eq 0 ]]; then
+        if [[ $? -eq 0 && -n "$sudoers_files" ]]; then  # Ensure non-empty result
             while IFS= read -r file; do
-                if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
-                    log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
-                else
-                    local error_msg=$(cat /tmp/cp_error)
-                    log_message "ERROR: Failed to backup $file - Error: $error_msg"
-                    rm -f /tmp/cp_error
-                    return 1
+                if [[ -n "$file" ]]; then  # CHANGED: Added check to skip empty lines, fixes backup failure due to empty path
+                    if cp "$file" "$BACKUP_DIR/$(basename "$file").$TIMESTAMP" 2>/tmp/cp_error; then
+                        log_message "INFO: Backed up $file to $BACKUP_DIR/$(basename "$file").$TIMESTAMP"
+                    else
+                        local error_msg=$(cat /tmp/cp_error)
+                        log_message "ERROR: Failed to backup $file - Error: $error_msg"
+                        rm -f /tmp/cp_error
+                        return 1
+                    fi
                 fi
             done <<< "$sudoers_files"
         else
-            local error_msg=$(cat /tmp/find_error)
+            local error_msg=$(cat /tmp/find_error 2>/dev/null || echo "No files found")
             log_message "WARNING: Failed to list files in $sudoers_dir - Error: $error_msg"
         fi
     fi

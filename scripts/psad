@@ -33,9 +33,8 @@ function f_psad {
     fi
 
     # Ensure psad is installed
-    if ! dpkg -l | grep -q "^ii.*psad" 2>/tmp/dpkg_error; then
+    if ! dpkg -l | grep -q "^ii.*psad"; then
         log_message "WARNING: psad package is not installed"
-        echo "psad package is not installed."
         log_message "INFO: Attempting to install psad"
         if $APT install -y psad 2>/tmp/apt_install_error; then
             log_message "INFO: Successfully installed psad"
@@ -117,6 +116,7 @@ function f_psad {
         "s|^[#]*DANGER_LEVEL5.*|DANGER_LEVEL5               10000;|"
         "s|^[#]*EMAIL_ALERT_DANGER_LEVEL.*|EMAIL_ALERT_DANGER_LEVEL    5;|"   # Alert at level 5
         "s|^[#]*EMAIL_LIMIT.*|EMAIL_LIMIT                 5;|"               # Limit emails
+        "s|^[#]*EMAIL_LIMIT_STATUS_MSG.*|EMAIL_LIMIT_STATUS_MSG       Y;|"    # CHANGED: Added to fix signature update failure
         "s|^[#]*EXPECT_TCP_OPTIONS.*|EXPECT_TCP_OPTIONS             Y;|"     # Enable TCP options
         "s|^[#]*ENABLE_MAC_ADDR_REPORTING.*|ENABLE_MAC_ADDR_REPORTING   Y;|"  # Enable MAC reporting
         "s|^[#]*AUTO_IDS_DANGER_LEVEL.*|AUTO_IDS_DANGER_LEVEL       1;|"     # Auto IDS at level 1

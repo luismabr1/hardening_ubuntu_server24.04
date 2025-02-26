@@ -110,8 +110,8 @@ function f_users {
                 local error_msg=$(cat /tmp/pkill_error 2>/dev/null || echo "No processes found")
                 log_message "WARNING: Failed to terminate processes for $user - Ignoring: $error_msg"
             fi
-            if userdel -r "$user" 2>/tmp/userdel_error; then
-                log_message "INFO: Successfully deleted user $user along with home directory"
+            if userdel -r --force "$user" 2>/tmp/userdel_error; then  # CHANGED: Added --force to ignore non-owned directories and missing spool files
+                log_message "INFO: Successfully deleted user $user along with home directory (forced)"
                 echo "User $user deleted successfully."
                 ((removed_count++))
             else

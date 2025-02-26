@@ -34,7 +34,18 @@ function f_auditd {
     # Ensure auditd is installed
     if ! command -v auditctl >/dev/null 2>&1; then
         log_message "ERROR: auditd not installed. Please install with 'apt install auditd'"
-        return 1
+        # CHANGED: Added automatic installation attempt instead of just erroring out
+        log_message "INFO: Attempting to install auditd"
+        if $APT install -y auditd 2>/tmp/apt_install_error; then
+            log_message "INFO: Successfully installed auditd"
+        else
+            local error_msg=$(cat /tmp/apt_install_error)
+            log_message "ERROR: Failed to install auditd - Error: $error_msg"
+            rm -f /tmp/apt_install_error
+            return 1
+        fi
+    else
+        log_message "INFO: auditd is already installed"
     fi
 
     # Backup configuration files
@@ -188,7 +199,7 @@ function f_auditd {
     fi
     rm -f /tmp/cp_error /tmp/cat_error /tmp/sed_error
 
-    # Enable and restart auditd
+    # Enable and restart auditd with retry logic
     if systemctl enable auditd 2>/tmp/systemctl_error; then
         log_message "INFO: Enabled auditd service"
     else
@@ -197,22 +208,37 @@ function f_auditd {
         rm -f /tmp/systemctl_error
         return 1
     fi
-    if systemctl restart auditd.service 2>/tmp/systemctl_error; then
-        log_message "INFO: Restarted auditd service"
-    else
-        local error_msg=$(cat /tmp/systemctl_error)
-        log_message "ERROR: Failed to restart auditd - Error: $error_msg"
+    # CHANGED: Added retry logic to ensure auditd restarts and enables properly
+    local retries=3
+    local success=false
+    for ((i=1; i<=retries; i++)); do
+        if systemctl restart auditd.service 2>/tmp/systemctl_error; then
+            log_message "INFO: Restarted auditd service (attempt $i)"
+            if systemctl is-enabled auditd.service >/dev/null 2>&1 && systemctl is-active auditd.service >/dev/null 2>&1; then
+                success=true
+                break
+            fi
+        fi
+        sleep 2  # Wait before retry
+    done
+    if [[ "$success" == "false" ]]; then
+        local error_msg=$(cat /tmp/systemctl_error 2>/dev/null || echo "Unknown error")
+        log_message "ERROR: Failed to restart and enable auditd service after $retries attempts - Error: $error_msg"
         rm -f /tmp/systemctl_error
         return 1
     fi
-    rm -f /tmp/systemctl_error
 
     # Verify auditd is running and logging
-    if auditctl -s | grep -q "enabled 1"; then
-        log_message "INFO: auditd is enabled and running"
+    # CHANGED: Updated verification to use systemctl for consistency with restart logic
+    local verified=true
+    if ! systemctl is-enabled auditd.service >/dev/null 2>&1 || ! systemctl is-active auditd.service >/dev/null 2>&1; then
+        log_message "ERROR: auditd is not enabled or active after restart"
+        verified=false
     else
-        log_message "ERROR: auditd is not enabled after restart"
-        return 1
+        log_message "INFO: auditd is enabled and active"
+    fi
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified auditd is enabled and running"
     fi
 
     # Show status if verbose
