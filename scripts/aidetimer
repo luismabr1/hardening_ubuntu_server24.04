@@ -154,5 +154,79 @@ EOF
 
     # Reload systemd daemon
     log_message "DEBUG: Reloading systemd daemon"
-    if systemctl daemon-reload 2>/tmp/systemctl_reload
+    if systemctl daemon-reload 2>/tmp/systemctl_reload_error; then
+        log_message "INFO: Successfully reloaded systemd daemon"
+    else
+        local error_msg=$(cat /tmp/systemctl_reload_error)
+        log_message "ERROR: Failed to reload systemd daemon - Error: $error_msg"
+        rm -f /tmp/systemctl_reload_error
+        return 1
+    fi
+
+    # Enable and start the timer with retry logic
+    log_message "DEBUG: Enabling and starting AIDE timer"
+    local timer_unit=$(basename "$AIDE_TIMER")
+    local retries=3
+    local success=false
+    for ((i=1; i<=retries; i++)); do
+        if systemctl enable "$timer_unit" 2>/tmp/systemctl_error; then
+            log_message "INFO: Enabled AIDE timer ($timer_unit) on attempt $i"
+            if systemctl start "$timer_unit" 2>/tmp/systemctl_error; then
+                log_message "INFO: Started AIDE timer ($timer_unit) on attempt $i"
+                success=true
+                break
+            else
+                local error_msg=$(cat /tmp/systemctl_error)
+                log_message "WARNING: Failed to start AIDE timer ($timer_unit) on attempt $i - Error: $error_msg"
+            fi
+        else
+            local error_msg=$(cat /tmp/systemctl_error)
+            log_message "WARNING: Failed to enable AIDE timer ($timer_unit) on attempt $i - Error: $error_msg"
+        fi
+        sleep 2
+    done
+    if [[ "$success" == "false" ]]; then
+        local error_msg=$(cat /tmp/systemctl_error 2>/dev/null || echo "Unknown error")
+        log_message "ERROR: Failed to enable/start AIDE timer ($timer_unit) after $retries attempts - Error: $error_msg"
+        rm -f /tmp/systemctl_error
+        return 1
+    fi
+
+    # Verify timer setup
+    log_message "DEBUG: Verifying AIDE timer setup"
+    local verified=true
+    if systemctl is-enabled "$timer_unit" >/dev/null 2>&1; then
+        log_message "INFO: Verified AIDE timer ($timer_unit) is enabled"
+    else
+        log_message "WARNING: AIDE timer ($timer_unit) is not enabled"
+        verified=false
+    fi
+    if systemctl is-active "$timer_unit" >/dev/null 2>&1; then
+        log_message "INFO: Verified AIDE timer ($timer_unit) is active"
+    else
+        log_message "WARNING: AIDE timer ($timer_unit) is not active"
+        verified=false
+    fi
+    if [[ "$verified" == "true" ]]; then
+        log_message "INFO: Verified AIDE timer setup"
+    else
+        log_message "ERROR: AIDE timer setup incomplete (not fully enabled/active)"
+        return 1
+    fi
+
+    # Show status if verbose
+    if [[ "$VERBOSE" == "Y" ]]; then
+        systemctl status "$timer_unit" --no-pager
+        echo
+    fi
+
+    log_message "DEBUG: f_aide_timer completed successfully"
+    rm -f /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/systemctl_error /tmp/systemctl_reload_error /tmp/cp_error /tmp/apt_install_error
+    ((SCRIPT_COUNT++))
 }
+
+# Execute the function with enhanced trap
+echo "[HARDENING LOG - $(hostname --fqdn) - $(LANG=C date)]" > "$LOG_FILE"
+trap 'log_message "ERROR: Script terminated unexpectedly at line $LINENO with exit code $?"; exit 1' ERR
+set -e  # Exit on any error
+f_aide_timer
