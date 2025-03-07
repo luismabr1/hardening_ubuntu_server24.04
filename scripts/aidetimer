@@ -2,24 +2,14 @@
 
 # Standalone script for f_aide_timer
 
-# Global variables
-LOG_FILE="/var/log/user_hardening.log"
-BACKUP_DIR="/root/backups"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-VERBOSE='N'  # Default to no verbose output; override in main script if needed
-SCRIPT_COUNT=0
-APT='apt-get'
-AIDE_CONF='/etc/aide/aide.conf'
-AIDE_SERVICE='/etc/systemd/system/aidecheck.service'
-AIDE_TIMER='/etc/systemd/system/aidecheck.timer'
-
-# Function to log messages
+# Function to log messages with fallback
 log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+    local message="$(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo "$message" | tee -a "$LOG_FILE" 2>/dev/null || echo "$message" >&2
 }
 
 function f_aide_timer {
-    echo "[$SCRIPT_COUNT] Configuring AIDE timer for periodic checks"
+    log_message "DEBUG: Starting f_aide_timer"
 
     # Check if running as root
     if [[ $EUID -ne 0 ]]; then
@@ -28,7 +18,14 @@ function f_aide_timer {
         return 1
     fi
 
+    # Check log file writability
+    if ! touch "$LOG_FILE" 2>/dev/null; then
+        log_message "ERROR: Log file $LOG_FILE is not writable"
+        return 1
+    fi
+
     # Ensure aide and systemd are installed
+    log_message "DEBUG: Checking required packages"
     local required_pkgs=("aide" "systemd")
     for pkg in "${required_pkgs[@]}"; do
         if ! dpkg -l | grep -q "^ii.*$pkg"; then
@@ -48,6 +45,7 @@ function f_aide_timer {
     done
 
     # Backup existing service and timer files
+    log_message "DEBUG: Backing up AIDE files"
     mkdir -p "$BACKUP_DIR" || {
         log_message "ERROR: Failed to create backup directory $BACKUP_DIR"
         return 1
@@ -66,7 +64,17 @@ function f_aide_timer {
         fi
     done
 
+    # Clean up residual typo files
+    log_message "DEBUG: Cleaning up residual typo files"
+    local systemd_dir="/etc/systemd/system"
+    if ls "$systemd_dir"/aidecheck.tiemr* >/dev/null 2>&1; then
+        rm -f "$systemd_dir"/aidecheck.tiemr* && \
+            log_message "INFO: Removed residual typo files (aidecheck.tiemr*) from $systemd_dir" || \
+            log_message "WARNING: Failed to remove residual typo files (aidecheck.tiemr*)"
+    fi
+
     # Create AIDE check service
+    log_message "DEBUG: Creating AIDE service"
     local service_content=$(cat <<EOF
 [Unit]
 Description=AIDE Filesystem Integrity Check
@@ -105,7 +113,8 @@ EOF
         return 1
     fi
 
-    # Create AIDE check timer (daily at 4 AM, CIS 1.3.2)
+    # Create AIDE check timer
+    log_message "DEBUG: Creating AIDE timer"
     local timer_content=$(cat <<EOF
 [Unit]
 Description=Daily AIDE Filesystem Integrity Check Timer
@@ -143,64 +152,7 @@ EOF
         return 1
     fi
 
-    # Reload systemd daemon to recognize new units
-    if systemctl daemon-reload 2>/tmp/systemctl_reload_error; then
-        log_message "INFO: Successfully reloaded systemd daemon"
-    else
-        local error_msg=$(cat /tmp/systemctl_reload_error)
-        log_message "ERROR: Failed to reload systemd daemon - Error: $error_msg"
-        rm -f /tmp/systemctl_reload_error
-        return 1
-    fi
-
-    # Enable and start the timer using basename to avoid path issues
-    local timer_unit=$(basename "$AIDE_TIMER")
-    if systemctl enable "$timer_unit" 2>/tmp/systemctl_error; then
-        log_message "INFO: Enabled AIDE timer ($timer_unit)"
-        if systemctl start "$timer_unit" 2>/tmp/systemctl_error; then
-            log_message "INFO: Started AIDE timer ($timer_unit)"
-        else
-            local error_msg=$(cat /tmp/systemctl_error)
-            log_message "ERROR: Failed to start AIDE timer ($timer_unit) - Error: $error_msg"
-            rm -f /tmp/systemctl_error
-            return 1
-        fi
-    else
-        local error_msg=$(cat /tmp/systemctl_error)
-        log_message "ERROR: Failed to enable AIDE timer ($timer_unit) - Error: $error_msg"
-        rm -f /tmp/systemctl_error
-        return 1
-    fi
-
-    # Verify timer setup
-    local verified=true
-    if systemctl is-enabled "$timer_unit" >/dev/null 2>&1; then
-        log_message "INFO: Verified AIDE timer ($timer_unit) is enabled"
-    else
-        log_message "WARNING: AIDE timer ($timer_unit) is not enabled"
-        verified=false
-    fi
-    if systemctl is-active "$timer_unit" >/dev/null 2>&1; then
-        log_message "INFO: Verified AIDE timer ($timer_unit) is active"
-    else
-        log_message "WARNING: AIDE timer ($timer_unit) is not active"
-        verified=false
-    fi
-    if [[ "$verified" == "true" ]]; then
-        log_message "INFO: Verified AIDE timer setup"
-    fi
-
-    # Show status if verbose
-    if [[ "$VERBOSE" == "Y" ]]; then
-        systemctl status "$timer_unit" --no-pager
-        echo
-    fi
-
-    rm -f /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/systemctl_error /tmp/systemctl_reload_error /tmp/cp_error /tmp/apt_install_error
-    ((SCRIPT_COUNT++))
+    # Reload systemd daemon
+    log_message "DEBUG: Reloading systemd daemon"
+    if systemctl daemon-reload 2>/tmp/systemctl_reload
 }
-
-# Execute the function
-echo "[HARDENING LOG - $(hostname --fqdn) - $(LANG=C date)]" > "$LOG_FILE"
-trap 'log_message "ERROR: Script terminated unexpectedly with exit code $?"; exit 1' ERR
-f_aide_timer
