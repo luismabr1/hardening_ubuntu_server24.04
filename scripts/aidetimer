@@ -3,15 +3,15 @@
 # Standalone script for f_aide_timer
 
 # Global variables
-#LOG_FILE="/var/log/user_hardening.log"
-#BACKUP_DIR="/root/backups"
-#TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-#VERBOSE='N'  # Default to no verbose output; override in main script if needed
-#SCRIPT_COUNT=0
-#APT='apt-get'
-#AIDE_CONF='/etc/aide/aide.conf'
-#AIDE_SERVICE='/etc/systemd/system/aidecheck.service'
-#AIDE_TIMER='/etc/systemd/system/aidecheck.timer'
+LOG_FILE="/var/log/user_hardening.log"
+BACKUP_DIR="/root/backups"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+VERBOSE='N'  # Default to no verbose output; override in main script if needed
+SCRIPT_COUNT=0
+APT='apt-get'
+AIDE_CONF='/etc/aide/aide.conf'
+AIDE_SERVICE='/etc/systemd/system/aidecheck.service'
+AIDE_TIMER='/etc/systemd/system/aidecheck.timer'
 
 # Function to log messages
 log_message() {
@@ -143,36 +143,47 @@ EOF
         return 1
     fi
 
-    # Enable and start the timer
-    if systemctl enable "$AIDE_TIMER" 2>/tmp/systemctl_error; then
-        log_message "INFO: Enabled AIDE timer"
-        if systemctl start "$AIDE_TIMER" 2>/tmp/systemctl_error; then
-            log_message "INFO: Started AIDE timer"
+    # Reload systemd daemon to recognize new units
+    if systemctl daemon-reload 2>/tmp/systemctl_reload_error; then
+        log_message "INFO: Successfully reloaded systemd daemon"
+    else
+        local error_msg=$(cat /tmp/systemctl_reload_error)
+        log_message "ERROR: Failed to reload systemd daemon - Error: $error_msg"
+        rm -f /tmp/systemctl_reload_error
+        return 1
+    fi
+
+    # Enable and start the timer using basename to avoid path issues
+    local timer_unit=$(basename "$AIDE_TIMER")
+    if systemctl enable "$timer_unit" 2>/tmp/systemctl_error; then
+        log_message "INFO: Enabled AIDE timer ($timer_unit)"
+        if systemctl start "$timer_unit" 2>/tmp/systemctl_error; then
+            log_message "INFO: Started AIDE timer ($timer_unit)"
         else
             local error_msg=$(cat /tmp/systemctl_error)
-            log_message "ERROR: Failed to start AIDE timer - Error: $error_msg"
+            log_message "ERROR: Failed to start AIDE timer ($timer_unit) - Error: $error_msg"
             rm -f /tmp/systemctl_error
             return 1
         fi
     else
         local error_msg=$(cat /tmp/systemctl_error)
-        log_message "ERROR: Failed to enable AIDE timer - Error: $error_msg"
+        log_message "ERROR: Failed to enable AIDE timer ($timer_unit) - Error: $error_msg"
         rm -f /tmp/systemctl_error
         return 1
     fi
 
     # Verify timer setup
     local verified=true
-    if systemctl is-enabled "$(basename "$AIDE_TIMER")" >/dev/null 2>&1; then
-        log_message "INFO: Verified AIDE timer is enabled"
+    if systemctl is-enabled "$timer_unit" >/dev/null 2>&1; then
+        log_message "INFO: Verified AIDE timer ($timer_unit) is enabled"
     else
-        log_message "WARNING: AIDE timer is not enabled"
+        log_message "WARNING: AIDE timer ($timer_unit) is not enabled"
         verified=false
     fi
-    if systemctl is-active "$(basename "$AIDE_TIMER")" >/dev/null 2>&1; then
-        log_message "INFO: Verified AIDE timer is active"
+    if systemctl is-active "$timer_unit" >/dev/null 2>&1; then
+        log_message "INFO: Verified AIDE timer ($timer_unit) is active"
     else
-        log_message "WARNING: AIDE timer is not active"
+        log_message "WARNING: AIDE timer ($timer_unit) is not active"
         verified=false
     fi
     if [[ "$verified" == "true" ]]; then
@@ -181,11 +192,11 @@ EOF
 
     # Show status if verbose
     if [[ "$VERBOSE" == "Y" ]]; then
-        systemctl status "$(basename "$AIDE_TIMER")" --no-pager
+        systemctl status "$timer_unit" --no-pager
         echo
     fi
 
-    rm -f /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/systemctl_error /tmp/cp_error /tmp/apt_install_error
+    rm -f /tmp/echo_error /tmp/chmod_error /tmp/chown_error /tmp/systemctl_error /tmp/systemctl_reload_error /tmp/cp_error /tmp/apt_install_error
     ((SCRIPT_COUNT++))
 }
 
